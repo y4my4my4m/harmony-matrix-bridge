@@ -33,6 +33,6 @@ product/security decisions; Matrix power levels must not grant native Harmony ri
 ## Harmony integration
 
 Native UI, profiles/mentions, registration, database migrations and scoped API contracts
-remain in [Harmony](https://github.com/y4my4my4m/harmony). Initial support is tracked by
-[Harmony PR #197](https://github.com/y4my4my4m/harmony/pull/197).
+remain in [Harmony](https://github.com/y4my4my4m/harmony). Initial support shipped in
+Harmony 1.9.8.
 Validate compatible deployed Gateway/DB contracts before a community-facing release.

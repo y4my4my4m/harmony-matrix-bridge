@@ -4,10 +4,9 @@ A self-run **Matrix application service with ghost and relay sender modes**, not
 in the Harmony client. This is the standalone service repository, separate from
 [Harmony](https://github.com/y4my4my4m/harmony), just like the Discord bridge.
 
-**Requires the Harmony-side support in [Harmony PR #197](https://github.com/y4my4my4m/harmony/pull/197).**
-Until that support is merged and deployed, a stock Harmony release is not sufficient.
-Native UI, database migrations, consent and attachment-byte endpoints belong in Harmony;
-this repository contains the worker, configuration, deployment and protocol tests.
+**Requires Harmony 1.9.8 or later**, which holds the Harmony side: the Matrix tab under Server
+settings → Bridges, the database migrations, consent and attachment-byte endpoints. This
+repository contains the worker, configuration, deployment and protocol tests.
 
 **Use dedicated test rooms/channels with consenting participants.** Explicit source
 allowlists remain mandatory. Harmony member-controlled relay consent is checked at
