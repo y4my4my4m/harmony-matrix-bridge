@@ -106,4 +106,30 @@ describe('HTTP', () => {
       expect((error as Error).message).not.toContain('SECRET');
     }
   });
+
+  it.each([['errcode', 'M_UNKNOWN_TOKEN'], ['errcode', 'M_EXCLUSIVE'], ['code', 'BRIDGE_AUTHOR_OPTED_OUT'], ['code', 'room_in_use'], ['code', 'room_changed'], ['code', 'erase_recent']])('carries the known %s %s and no unknown one', async (field, code) => {
+    for (const [body, expected] of [[{ [field]: code, error: 'SECRET' }, code], [{ [field]: 'SECRET' }, undefined]] as const) {
+      const error = await requestJson(new URL('https://host'), {}, vi.fn<typeof fetch>().mockResolvedValue(Response.json(body, { status: 403 }))).catch(e => e);
+      expect((error as HttpError).errcode).toBe(expected);
+    }
+  });
+
+  it('reads the delay of a rate limit from the header, else from the body', async () => {
+    for (const [headers, body, expected] of [[{}, { retry_after_ms: 2500 }, 2500], [{ 'Retry-After': '3' }, { retry_after_ms: 2500 }, 3000], [{}, { retry_after_ms: 'x' }, undefined], [{}, { retry_after_ms: -1 }, undefined], [{}, { retry_after_ms: 1e15 }, 86_400_000]] as const) {
+      const error = await requestJson(new URL('https://host'), {}, vi.fn<typeof fetch>().mockResolvedValue(Response.json(body, { status: 429, headers }))).catch(e => e);
+      expect((error as HttpError).retryAfterMs).toBe(expected);
+    }
+  });
+
+  it('is called off by the caller\'s signal, before or during the request', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(() => new Promise(() => {}));
+    const early = new AbortController();
+    early.abort();
+    await expect(requestJson(new URL('https://host'), { signal: early.signal }, fetchImpl)).rejects.toThrow('aborted');
+    const late = new AbortController();
+    const pending = requestJson(new URL('https://host'), { signal: late.signal }, fetchImpl);
+    late.abort();
+    await expect(pending).rejects.toThrow('aborted');
+    expect((fetchImpl.mock.calls[1][1]?.signal as AbortSignal).aborted).toBe(true);
+  });
 });

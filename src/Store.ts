@@ -11,11 +11,19 @@ export type Job = {
   attempts: number;
 };
 
-type NewJob = Omit<Job, "id" | "attempts">;
+export type NewJob = Omit<Job, "id" | "attempts">;
+/** A room the account is invited to and has not joined. */
+export interface Invite { roomId: string; name: string | null; alias: string | null; encrypted: boolean }
 export class StorageError extends Error {}
+/** The queue is full. Nothing of the transaction was kept. */
+export class QuotaError extends Error {}
+/** Jobs that stay queued: a direction, channels, and lanes (laneOf) with a job under way. */
+export interface HeldJobs { direction?: Job["direction"]; channels?: string[]; lanes?: string[] }
 const MAX_PENDING = 10_000;
 const MAX_PAYLOAD_BYTES = 1_048_576;
 const MAX_ERROR_LENGTH = 2_048;
+// The status report lists at most 500 rooms.
+const MAX_INVITES = 500;
 
 function nonempty(value: string, name: string): void {
   if (typeof value !== "string" || value.length === 0) {
@@ -35,10 +43,18 @@ function errorText(value: string): string {
   return value.slice(0, MAX_ERROR_LENGTH);
 }
 
+/** A channel's messages in one direction, delivered in order. */
+export function laneOf(job: Pick<Job, "direction" | "channelId">): string {
+  return `${job.direction} ${job.channelId}`;
+}
+
+// The first pending job of each lane: the others wait for it, retries included.
+const HEADS = "SELECT MIN(id) FROM jobs WHERE status = 'pending' GROUP BY direction, channel_id";
+
 /**
- * Durable inbox/outbox for a single synchronous worker. nextJob does not claim a
- * job: callers must finish/retry/fail it before asking for another one. Delivery
- * is at-least-once; a process crash after a remote POST can cause redelivery.
+ * Durable inbox/outbox for a single process. nextJob does not claim a job: callers
+ * hold its lane until they finish/retry/fail it. Delivery is at-least-once; a
+ * process crash after a remote POST can cause redelivery.
  *
  * At most 10,000 pending jobs and 1 MiB per serialized payload are accepted.
  * Quota errors roll back the entire transaction (including its receipt).
@@ -46,7 +62,7 @@ function errorText(value: string): string {
  * deployments must provision/monitor disk space. Parent directories must exist.
  */
 export class Store {
-  private readonly db: DatabaseSync;
+  protected readonly db: DatabaseSync;
 
   constructor(path: string) {
     nonempty(path, "path");
@@ -92,6 +108,8 @@ export class Store {
         );
         CREATE INDEX IF NOT EXISTS job_destinations_destination ON job_destinations(destination_id, job_id);
         CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(id) WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS jobs_lane ON jobs(direction, channel_id, id) WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS jobs_failed ON jobs(id) WHERE status = 'failed';
         CREATE INDEX IF NOT EXISTS jobs_destination ON jobs(direction, destination_id, channel_id, room_id) WHERE status = 'done';
         CREATE TABLE IF NOT EXISTS ghost_users (
           matrix_id TEXT PRIMARY KEY NOT NULL,
@@ -103,7 +121,28 @@ export class Store {
           matrix_id TEXT NOT NULL REFERENCES ghost_users(matrix_id),
           PRIMARY KEY(room_id, matrix_id)
         );
+        CREATE TABLE IF NOT EXISTS sync_state (
+          user_id TEXT PRIMARY KEY NOT NULL,
+          next_batch TEXT NOT NULL,
+          rooms TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS pair_starts (
+          channel_id TEXT NOT NULL,
+          room_id TEXT NOT NULL,
+          since INTEGER NOT NULL,
+          PRIMARY KEY(channel_id, room_id)
+        );
+        CREATE TABLE IF NOT EXISTS invites (
+          room_id TEXT PRIMARY KEY NOT NULL,
+          name TEXT,
+          alias TEXT,
+          encrypted INTEGER NOT NULL
+        );
       `);
+      // The profile last put on the ghost in the room; absent from 0.1.0 databases.
+      if (!this.db.prepare("PRAGMA table_info(ghost_rooms)").all().some(column => column.name === "profile")) {
+        this.db.exec("ALTER TABLE ghost_rooms ADD COLUMN profile TEXT");
+      }
     } catch (error) {
       this.db.close();
       throw error;
@@ -114,7 +153,7 @@ export class Store {
     this.db.close();
   }
 
-  private transaction<T>(operation: () => T): T {
+  protected transaction<T>(operation: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = operation();
@@ -133,14 +172,95 @@ export class Store {
         "INSERT INTO transactions(transaction_id) VALUES (?) ON CONFLICT DO NOTHING",
       ).run(transactionId);
       // Homeservers can reuse transaction IDs; deduplicate jobs by event, not by receipt.
-      let changed = receipt.changes !== 0;
-      for (const roomId of encryptedRoomIds) {
-        nonempty(roomId, "roomId");
-        if (this.db.prepare("INSERT INTO encrypted_rooms(room_id) VALUES (?) ON CONFLICT DO NOTHING").run(roomId).changes !== 0) changed = true;
-      }
-      for (const job of jobs) if (this.insert(job)) changed = true;
+      const changed = this.accept(jobs, encryptedRoomIds);
+      return receipt.changes !== 0 || changed;
+    });
+  }
+
+  acceptEvents(jobs: NewJob[], encryptedRoomIds: string[]): boolean {
+    return this.transaction(() => this.accept(jobs, encryptedRoomIds));
+  }
+
+  private accept(jobs: NewJob[], encryptedRoomIds: string[]): boolean {
+    let changed = false;
+    for (const roomId of encryptedRoomIds) {
+      nonempty(roomId, "roomId");
+      if (this.db.prepare("INSERT INTO encrypted_rooms(room_id) VALUES (?) ON CONFLICT DO NOTHING").run(roomId).changes !== 0) changed = true;
+    }
+    for (const job of jobs) if (this.insert(job)) changed = true;
+    return changed;
+  }
+
+  /**
+   * The sync token with the jobs and fences of the response that carried it, in one transaction.
+   * `rooms`: the rooms that response's filter named.
+   */
+  acceptSync(userId: string, nextBatch: string, rooms: string[], jobs: NewJob[], encryptedRoomIds: string[] = []): boolean {
+    nonempty(userId, "userId");
+    nonempty(nextBatch, "nextBatch");
+    return this.transaction(() => {
+      const changed = this.accept(jobs, encryptedRoomIds);
+      this.db.prepare(`
+        INSERT INTO sync_state(user_id, next_batch, rooms) VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET next_batch = excluded.next_batch, rooms = excluded.rooms
+      `).run(userId, nextBatch, JSON.stringify(rooms));
       return changed;
     });
+  }
+
+  syncState(userId: string): { nextBatch: string; rooms: string[] } | null {
+    return this.ghostState(() => {
+      const row = this.db.prepare("SELECT next_batch, rooms FROM sync_state WHERE user_id = ?").get(userId);
+      return row ? { nextBatch: row.next_batch as string, rooms: JSON.parse(row.rooms as string) as string[] } : null;
+    });
+  }
+
+  clearSync(userId: string): void {
+    this.ghostState(() => this.db.prepare("DELETE FROM sync_state WHERE user_id = ?").run(userId));
+  }
+
+  /** When this pair was first kept, epoch ms; the first value stays until the pair is forgotten. */
+  pairStart(channelId: string, roomId: string, now = Date.now()): number {
+    timestamp(now);
+    return this.ghostState(() => {
+      this.db.prepare("INSERT INTO pair_starts(channel_id, room_id, since) VALUES (?, ?, ?) ON CONFLICT DO NOTHING").run(channelId, roomId, now);
+      return this.db.prepare("SELECT since FROM pair_starts WHERE channel_id = ? AND room_id = ?").get(channelId, roomId)!.since as number;
+    });
+  }
+
+  /** Forgets every pair that `kept` does not name. */
+  prunePairStarts(kept: (channelId: string, roomId: string) => boolean): void {
+    this.ghostState(() => this.transaction(() => {
+      for (const row of this.db.prepare("SELECT channel_id, room_id FROM pair_starts").all()) {
+        if (!kept(row.channel_id as string, row.room_id as string)) {
+          this.db.prepare("DELETE FROM pair_starts WHERE channel_id = ? AND room_id = ?").run(row.channel_id!, row.room_id!);
+        }
+      }
+    }));
+  }
+
+  saveInvite(invite: Invite): void {
+    this.ghostState(() => this.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO invites(room_id, name, alias, encrypted) VALUES (?, ?, ?, ?)
+        ON CONFLICT(room_id) DO UPDATE SET name = excluded.name, alias = excluded.alias, encrypted = excluded.encrypted
+      `).run(invite.roomId, invite.name, invite.alias, invite.encrypted ? 1 : 0);
+      this.db.prepare("DELETE FROM invites WHERE rowid NOT IN (SELECT rowid FROM invites ORDER BY rowid DESC LIMIT ?)").run(MAX_INVITES);
+    }));
+  }
+
+  isInvited(roomId: string): boolean {
+    return this.ghostState(() => !!this.db.prepare("SELECT 1 FROM invites WHERE room_id = ?").get(roomId));
+  }
+
+  dropInvite(roomId: string): void {
+    this.ghostState(() => this.db.prepare("DELETE FROM invites WHERE room_id = ?").run(roomId));
+  }
+
+  invites(): Invite[] {
+    return this.ghostState(() => this.db.prepare("SELECT * FROM invites ORDER BY rowid DESC").all().map(row => ({
+      roomId: row.room_id as string, name: row.name as string | null, alias: row.alias as string | null, encrypted: row.encrypted === 1,
+    })));
   }
 
   isRoomBlocked(roomId: string): boolean {
@@ -178,16 +298,18 @@ export class Store {
     const pending = this.db.prepare(
       "SELECT COUNT(*) AS count FROM jobs WHERE status = 'pending'",
     ).get()!.count as number;
-    if (pending > MAX_PENDING) throw new Error("Pending job quota exceeded");
+    if (pending > MAX_PENDING) throw new QuotaError("Pending job quota exceeded");
     return true;
   }
 
-  nextJob(now = Date.now()): Job | null {
+  nextJob(now = Date.now(), held: HeldJobs = {}): Job | null {
     timestamp(now);
     for (;;) {
       const row = this.db.prepare(`
-        SELECT * FROM jobs WHERE status = 'pending' AND ready_at <= ? ORDER BY id LIMIT 1
-      `).get(now);
+        SELECT * FROM jobs WHERE id IN (${HEADS}) AND ready_at <= ? AND direction <> ?
+          AND channel_id NOT IN (SELECT value FROM json_each(?))
+          AND direction || ' ' || channel_id NOT IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT 1
+      `).get(now, held.direction ?? "", JSON.stringify(held.channels ?? []), JSON.stringify(held.lanes ?? []));
       if (!row) return null;
       let payload: unknown;
       try {
@@ -212,7 +334,14 @@ export class Store {
     }
   }
 
-  private ghostState<T>(operation: () => T): T {
+  /** When the next delayed job is due, epoch ms; null when none is delayed. */
+  nextReadyAt(now = Date.now()): number | null {
+    timestamp(now);
+    const row = this.db.prepare(`SELECT MIN(ready_at) AS at FROM jobs WHERE id IN (${HEADS}) AND ready_at > ?`).get(now);
+    return row?.at === null || row?.at === undefined ? null : row.at as number;
+  }
+
+  protected ghostState<T>(operation: () => T): T {
     try { return operation(); }
     catch { throw new StorageError('Bridge state could not be persisted'); }
   }
@@ -248,6 +377,18 @@ export class Store {
 
   trackGhostRoom(roomId: string, matrixId: string): void {
     this.ghostState(() => this.db.prepare('INSERT INTO ghost_rooms(room_id, matrix_id) VALUES (?, ?) ON CONFLICT DO NOTHING').run(roomId, matrixId));
+  }
+
+  /** The profile last put on this ghost in this room; null when it is not known to be there. */
+  ghostProfile(roomId: string, matrixId: string): string | null {
+    return this.ghostState(() => {
+      const row = this.db.prepare('SELECT profile FROM ghost_rooms WHERE room_id = ? AND matrix_id = ?').get(roomId, matrixId);
+      return row ? row.profile as string | null : null;
+    });
+  }
+
+  setGhostProfile(roomId: string, matrixId: string, profile: string | null): void {
+    this.ghostState(() => this.db.prepare('UPDATE ghost_rooms SET profile = ? WHERE room_id = ? AND matrix_id = ?').run(profile, roomId, matrixId));
   }
 
   ghostRooms(): string[] {
@@ -290,6 +431,11 @@ export class Store {
     `).run(errorText(error), readyAt, id);
   }
 
+  /** Done, with nothing to map: a later reply to the source finds no copy. */
+  finish(id: number): void {
+    this.db.prepare("UPDATE jobs SET status = 'done', error = NULL, payload = '{}' WHERE id = ? AND status = 'pending'").run(id);
+  }
+
   fail(id: number, reason: string): void {
     this.db.prepare(`
       UPDATE jobs SET status = 'failed', error = ?, payload = '{}' WHERE id = ? AND status = 'pending'
@@ -297,11 +443,9 @@ export class Store {
   }
 
   counts(): { pending: number; failed: number } {
-    const row = this.db.prepare(`
-      SELECT COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
-             COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed FROM jobs
-    `).get()!;
-    return { pending: row.pending as number, failed: row.failed as number };
+    // Two counts over partial indexes; done jobs are kept and not read.
+    const count = (status: string) => this.db.prepare(`SELECT COUNT(*) AS count FROM jobs WHERE status = '${status}'`).get()!.count as number;
+    return { pending: count("pending"), failed: count("failed") };
   }
 
   findSource(direction: Job["direction"], destinationId: string, channelId: string, roomId: string): string | null {

@@ -12,11 +12,13 @@ import { promisify } from 'node:util';
 import { once } from 'node:events';
 import { WebSocketServer } from 'ws';
 import { createMediaGateway, runMediaSmoke, MEDIA_LIMIT } from './media-smoke.mjs';
+import { managedRegistration, runManagedSmoke } from './managed-smoke.mjs';
+import { instanceRegistration, runHostSmoke } from './host-smoke.mjs';
 
 const exec = promisify(execFile);
 const image = 'ghcr.io/element-hq/synapse:latest';
 const runId = randomUUID();
-const name = `harmony-matrix-smoke-${runId}`;
+const name = `mxc-matrix-smoke-${runId}`;
 const label = 'org.harmony.matrix-bridge.smoke';
 const secret = () => randomBytes(32).toString('hex');
 const asToken = secret();
@@ -164,7 +166,7 @@ async function main() {
     if (shuttingDown) return;
     console.error(`FAIL during ${stage}: smoke deadline exceeded`);
     void cleanup().finally(() => process.exit(1));
-  }, 240_000);
+  }, 600_000);
   stage = 'private configuration';
   directory = await mkdtemp(join(tmpdir(), 'harmony-matrix-smoke-'));
   await chmod(directory, 0o700);
@@ -205,12 +207,17 @@ async function main() {
     report_stats: false,
     trusted_key_servers: [],
     suppress_key_server_warning: true,
-    app_service_config_files: ['/data/registration.json'],
+    app_service_config_files: ['/data/registration.json', '/data/managed/registration.json', '/data/instance/registration.json'],
     encryption_enabled_by_default_for_room_type: 'off',
     // The isolated smoke sends a short burst of real human reply/edit/thread events.
     rc_message: { per_second: 100, burst_count: 100 },
+    rc_room_creation: { per_second: 100, burst_count: 100 },
+    rc_invites: { per_room: { per_second: 100, burst_count: 100 }, per_user: { per_second: 100, burst_count: 100 }, per_issuer: { per_second: 100, burst_count: 100 } },
   };
   await writeFile(join(directory, 'registration.json'), JSON.stringify(registration), { mode: 0o600 });
+  const managedPort = await freePort();
+  const managedPlan = await managedRegistration(join(directory, 'managed'), managedPort, homeserverUrl);
+  const instance = await instanceRegistration(directory, await freePort());
   // YAML accepts JSON, so this requires no YAML/npm dependency.
   await writeFile(join(directory, 'homeserver.yaml'), JSON.stringify(config), { mode: 0o600 });
   await writeFile(join(directory, 'signing.key'), `ed25519 smoke ${randomBytes(32).toString('base64').replace(/=+$/, '')}\n`, { mode: 0o600 });
@@ -637,6 +644,10 @@ async function main() {
   console.log('PASS encrypted-room relay guard (no additional text/avatar upload)');
   console.log('PASS actual room encryption fences queued files in both directions before media download, upload or send');
   console.log('PASS roomIsPlaintext returns false after encryption state is enabled');
+
+  await runManagedSmoke({ json, until, listen, freePort, homeserverUrl, user, plan: managedPlan, port: managedPort, directory, registrationSecret,
+    setStage: value => { stage = value; } });
+  await runHostSmoke({ json, until, listen, freePort, homeserverUrl, user, instance, directory, registrationSecret, setStage: value => { stage = value; } });
   console.log('PASS real Synapse smoke complete (plaintext only; no E2EE relay/decryption claimed)');
 }
 

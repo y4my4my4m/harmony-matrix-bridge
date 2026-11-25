@@ -7,7 +7,7 @@ const config = configSchema.parse({
   matrix: { homeserverUrl: 'https://matrix.test', serverName: 'matrix.test', applicationServiceUrl: 'http://localhost', allowedUserIds: ['@sam:matrix.test'] },
   pairs: [{ harmonyChannelId: '22222222-2222-4222-8222-222222222222', matrixRoomId: '!room:test' }],
 })
-const id = config.harmony.allowedUserIds[0]
+const id = config.harmony.allowedUserIds![0]
 const ghost = ghostUserId(config, id)
 const member = { id, username: 'alice', display_name: 'Room Alice', domain: 'harmony.test', avatar_url: null }
 
@@ -45,5 +45,20 @@ describe('mentions', () => {
     const result = harmonyToMatrix([{ type: 'mention', userId: '@sam:test', username: 'sam' }], '', new Map([['@sam:test', '@sam:test']]))
     expect(result.userIds).toEqual([])
     expect(result.formattedBody).toBeUndefined()
+  })
+  it('reads line breaks, paragraphs, entities and several links as the plain text says them', () => {
+    const pill = (label: string) => `<a class='x' HREF='https://matrix.to/#/${encodeURIComponent(ghost)}?via=matrix.test'><b>${label}</b></A >`
+    const parts = matrixToHarmony('a & b\n\nAl ice\nand <Al> < end', `<p>a &amp; b</p>\n<p class="y">${pill('Al ice')}<br />and ${pill('&lt;Al&gt;')} < end`, [ghost], [member], config)
+    expect(parts.map(part => part.type === 'text' ? part.text : `@${part.username}`)).toEqual(['a & b\n\n', '@alice', '\nand ', '@alice', ' < end'])
+    const open = `<a href="https://matrix.to/#/${encodeURIComponent(ghost)}">Al`
+    expect(matrixToHarmony('Al', open, [ghost], [member], config).map(part => part.text ?? part.userId)).toEqual(['Al', ' ', id])
+  })
+  it('costs no more than the length of what a stranger wrote', () => {
+    for (const html of ['<a' + ' '.repeat(31_000), '<a '.repeat(10_000), '<br' + ' '.repeat(31_000), '<br '.repeat(7_000), '<'.repeat(32_000), '</p> '.repeat(6_000), '<a href=' .repeat(3_000) + '>',
+      '<a href="https://matrix.to/#/x">'.repeat(1_000), '<a ' + 'href '.repeat(6_000) + '>', '<p></p>'.repeat(4_000)]) {
+      const started = performance.now()
+      matrixToHarmony('x', html, [ghost], [member], config)
+      expect(performance.now() - started, html.slice(0, 20)).toBeLessThan(60)
+    }
   })
 })

@@ -1,4 +1,4 @@
-import { ghostOwner, type Config } from './config.js'
+import { ghostOwner, type MatrixIdentity } from './config.js'
 import type { BridgeMember } from './HarmonyClient.js'
 
 type Part = Record<string, unknown>
@@ -13,8 +13,51 @@ function decodeHtml(value: string): string {
     return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : ''
   })
 }
-function plainHtml(value: string): string {
-  return decodeHtml(value.replace(/<br\s*\/?\s*>/gi, '\n').replace(/<\/p\s*>\s*<p\b[^>]*>/gi, '\n\n').replace(/<[^>]*>/g, ''))
+/** Text and tags of an HTML body, in one pass over it: what a stranger wrote costs no more than its length. */
+function tokens(html: string): Array<{ text: string } | { tag: string }> {
+  const found: Array<{ text: string } | { tag: string }> = []
+  for (let at = 0; at < html.length;) {
+    const open = html.indexOf('<', at)
+    const close = open < 0 ? -1 : html.indexOf('>', open)
+    if (close < 0) {
+      found.push({ text: html.slice(at) })
+      break
+    }
+    if (open > at) found.push({ text: html.slice(at, open) })
+    found.push({ tag: html.slice(open + 1, close) })
+    at = close + 1
+  }
+  return found
+}
+/** The text, and each matrix.to link with the text before it. */
+function readHtml(html: string): { links: Array<{ before: string; label: string; target: string }>; after: string } {
+  const list = tokens(html)
+  const links: Array<{ before: string; label: string; target: string }> = []
+  let text = ''
+  let link: { start: number; target: string } | null = null
+  for (let index = 0; index < list.length; index++) {
+    const token = list[index]
+    if ('text' in token) { text += decodeHtml(token.text); continue }
+    const name = /^\/?[a-z0-9]{0,20}/i.exec(token.tag)![0].toLowerCase()
+    if (name === 'br') text += '\n'
+    else if (name === '/p') {
+      const gap = list[index + 1]
+      const blank = gap !== undefined && 'text' in gap && !gap.text.trim()
+      const next = list[index + (blank ? 2 : 1)]
+      if (next !== undefined && 'tag' in next && /^p(?:\s|$)/i.test(next.tag)) {
+        text += '\n\n'
+        index += blank ? 2 : 1
+      }
+    } else if (name === 'a' && link === null && token.tag.length <= 2048) {
+      const target = /\shref\s*=\s*["'](https:\/\/matrix\.to\/#\/[^"']+)["']/i.exec(token.tag)?.[1]
+      if (target !== undefined) link = { start: text.length, target }
+    } else if (name === '/a' && link !== null) {
+      links.push({ before: text.slice(0, link.start), label: text.slice(link.start), target: link.target })
+      link = null
+      text = ''
+    }
+  }
+  return { links, after: text }
 }
 function nativeMention(member: BridgeMember): Part {
   return { type: 'mention', userId: member.id, username: member.username, domain: member.domain,
@@ -22,7 +65,7 @@ function nativeMention(member: BridgeMember): Part {
 }
 
 /** Only explicit annotations and validated matrix.to pills create notifications; never guessed names. */
-export function matrixToHarmony(body: string, formatted: unknown, mentionIds: unknown, members: BridgeMember[], config: Config): Part[] {
+export function matrixToHarmony(body: string, formatted: unknown, mentionIds: unknown, members: BridgeMember[], config: { matrix: MatrixIdentity }): Part[] {
   const eligible = new Map(members.map(member => [member.id, member]))
   const targets = new Map<string, BridgeMember>()
   if (Array.isArray(mentionIds) && mentionIds.length <= 100) {
@@ -42,22 +85,17 @@ export function matrixToHarmony(body: string, formatted: unknown, mentionIds: un
   const used = new Set<string>()
   if (typeof formatted === 'string' && formatted.length <= 32_000) {
     // Parse only explicit anchors; no HTML, URL fetch or display-name replacement enters Harmony.
-    const anchors = /<a\s+[^>]*href\s*=\s*["'](https:\/\/matrix\.to\/#\/[^"']+)["'][^>]*>([\s\S]*?)<\/a\s*>/gi
-    let offset = 0
+    const { links, after } = readHtml(formatted)
     let rendered = ''
-    for (const match of formatted.matchAll(anchors)) {
-      const before = plainHtml(formatted.slice(offset, match.index))
-      const label = plainHtml(match[2])
-      parts.push({ type: 'text', text: before })
-      rendered += before + label
+    for (const link of links) {
+      parts.push({ type: 'text', text: link.before })
+      rendered += link.before + link.label
       let id = ''
-      try { id = decodeURIComponent(decodeHtml(match[1]).slice('https://matrix.to/#/'.length).split('?')[0]) } catch { /* Invalid URI is plain text. */ }
+      try { id = decodeURIComponent(decodeHtml(link.target).slice('https://matrix.to/#/'.length).split('?')[0]) } catch { /* Invalid URI is plain text. */ }
       const target = targets.get(id)
-      parts.push(target ? nativeMention(target) : { type: 'text', text: label })
+      parts.push(target ? nativeMention(target) : { type: 'text', text: link.label })
       if (target) used.add(id)
-      offset = match.index! + match[0].length
     }
-    const after = plainHtml(formatted.slice(offset))
     parts.push({ type: 'text', text: after })
     rendered += after
     // Reject HTML/plaintext disagreement rather than changing the sender's text.

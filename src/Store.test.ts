@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { Store, StorageError, type Job } from "./Store.js";
+import { laneOf, QuotaError, Store, StorageError, type Job } from "./Store.js";
 
 type NewJob = Omit<Job, "id" | "attempts">;
 const job = (sourceId = "source", overrides: Partial<NewJob> = {}): NewJob => ({
@@ -148,7 +148,8 @@ describe("Store", () => {
   it("keeps receipts, terminal dedupe, attempts, scheduling and mappings across restart", () => {
     const path = file();
     let store = open(path);
-    store.acceptTransaction("txn", [job("a"), job("b"), job("c")]);
+    const c = job("c", { channelId: "other" });
+    store.acceptTransaction("txn", [job("a"), job("b"), c]);
     const a = store.nextJob(0)!;
     store.complete(a.id, "destination-a");
     const b = store.nextJob(0)!;
@@ -156,9 +157,9 @@ describe("Store", () => {
     store.fail(store.nextJob(0)!.id, "permanent");
     close(store);
     store = open(path);
-    expect(store.acceptTransaction("txn", [job("a"), job("b"), job("c")])).toBe(false);
+    expect(store.acceptTransaction("txn", [job("a"), job("b"), c])).toBe(false);
     expect(store.enqueue(job("a"))).toBe(false);
-    expect(store.enqueue(job("c"))).toBe(false);
+    expect(store.enqueue(c)).toBe(false);
     expect(store.counts()).toEqual({ pending: 1, failed: 1 });
     expect(store.findMapping("to_harmony", "a", "channel", "!room:example.org"))
       .toBe("destination-a");
@@ -199,19 +200,73 @@ describe("Store", () => {
     finally { db.close(); }
   });
 
-  it("returns ready jobs in stable ID order, not retry timestamp order", () => {
+  it("keeps a channel's order through retries, and lets other channels and the other direction pass", () => {
     const store = memory();
-    for (const source of ["a", "b", "c"]) store.enqueue(job(source));
+    for (const source of ["a", "b"]) store.enqueue(job(source));
+    store.enqueue(job("other", { channelId: "other" }));
+    store.enqueue(job("back", { direction: "to_matrix" }));
     const a = store.nextJob(0)!;
+    expect(a.sourceId).toBe("a");
     store.retry(a.id, "later", 100, 0);
-    const b = store.nextJob(0)!;
-    expect(b.sourceId).toBe("b");
-    store.retry(b.id, "soon", 10, 0);
-    expect(store.nextJob(0)!.sourceId).toBe("c");
-    expect(store.nextJob(10)!.sourceId).toBe("b");
+    const other = store.nextJob(0)!;
+    expect(other.sourceId).toBe("other");
+    store.retry(other.id, "soon", 10, 0);
+    expect(store.nextJob(0)!.sourceId).toBe("back");
+    expect(store.nextReadyAt(0)).toBe(10);
+    store.finish(store.nextJob(0)!.id);
+    expect(store.nextJob(0)).toBeNull();
+    expect(store.nextJob(10)!.sourceId).toBe("other");
+    expect(store.nextReadyAt(10)).toBe(100);
     expect(store.nextJob(100)).toMatchObject({ id: a.id, attempts: 1 });
     store.retry(a.id, "again", 0, 100);
     expect(store.nextJob(100)!.attempts).toBe(2);
+    store.fail(a.id, "given up");
+    expect(store.nextJob(100)!.sourceId).toBe("b");
+    expect(store.nextReadyAt(200)).toBeNull();
+  });
+
+  it("leaves lanes under way alone, one direction of a channel at a time", () => {
+    const store = memory();
+    store.enqueue(job("a"));
+    store.enqueue(job("b", { direction: "to_matrix" }));
+    store.enqueue(job("c", { channelId: "other" }));
+    const lanes = [laneOf(store.nextJob(0)!)];
+    expect(lanes).toEqual(["to_harmony channel"]);
+    expect(store.nextJob(0, { lanes })!.sourceId).toBe("b");
+    lanes.push("to_matrix channel");
+    expect(store.nextJob(0, { lanes })!.sourceId).toBe("c");
+    lanes.push("to_harmony other");
+    expect(store.nextJob(0, { lanes })).toBeNull();
+  });
+
+  it("finds the next job of ten thousand within a few milliseconds", () => {
+    const store = memory();
+    store.acceptTransaction("many", Array.from({ length: 10_000 }, (_, index) => job(String(index), { channelId: `channel-${index % 3}` })));
+    const lanes = ["to_harmony channel-0", "to_harmony channel-1"];
+    const started = performance.now();
+    for (let round = 0; round < 50; round++) expect(store.nextJob(0, { lanes })!.sourceId).toBe("2");
+    expect((performance.now() - started) / 50).toBeLessThan(20);
+  }, 20_000);
+
+  it("remembers the profile a ghost shows in a room, across restart", () => {
+    const path = file();
+    let store = open(path);
+    store.reserveGhost("@ghost:test", "user");
+    expect(store.ghostProfile("!room", "@ghost:test")).toBeNull();
+    store.trackGhostRoom("!room", "@ghost:test");
+    expect(store.ghostProfile("!room", "@ghost:test")).toBeNull();
+    store.setGhostProfile("!room", "@ghost:test", "profile");
+    close(store);
+    store = open(path);
+    store.trackGhostRoom("!room", "@ghost:test");
+    expect(store.ghostProfile("!room", "@ghost:test")).toBe("profile");
+    expect(store.ghostProfile("!other", "@ghost:test")).toBeNull();
+    store.setGhostProfile("!room", "@ghost:test", null);
+    expect(store.ghostProfile("!room", "@ghost:test")).toBeNull();
+    store.setGhostProfile("!room", "@ghost:test", "again");
+    store.forgetGhostRoom("!room", "@ghost:test");
+    store.trackGhostRoom("!room", "@ghost:test");
+    expect(store.ghostProfile("!room", "@ghost:test")).toBeNull();
   });
 
   it("atomically completes mappings with exact lookup keys and immutable terminal states", () => {
@@ -302,7 +357,7 @@ describe("Store", () => {
     const roomId = '!quota-fence:example.org';
     expect(() => store.acceptTransaction('full', [job('reuse-extra')], [roomId])).toThrow(/quota/);
     expect(store.isRoomBlocked(roomId)).toBe(false);
-    expect(() => store.acceptTransaction("overflow", [job("extra")])).toThrow(/quota/);
+    expect(() => store.acceptTransaction("overflow", [job("extra")])).toThrow(QuotaError);
     expect(store.counts().pending).toBe(10_000);
     store.complete(store.nextJob()!.id, "done");
     expect(store.acceptTransaction('full', [job('reuse-extra')], [roomId])).toBe(true);
@@ -312,4 +367,94 @@ describe("Store", () => {
     expect(store.acceptTransaction("overflow", [job("extra")])).toBe(true);
     expect(store.counts().pending).toBe(10_000);
   }, 20_000);
+
+  it("holds back a direction and channels without losing their order", () => {
+    const store = memory();
+    store.enqueue(job("a", { direction: "to_matrix" }));
+    store.enqueue(job("b", { channelId: "joining" }));
+    store.enqueue(job("c"));
+    expect(store.nextJob(0, { direction: "to_matrix", channels: ["joining"] })!.sourceId).toBe("c");
+    expect(store.nextJob(0, { channels: ["joining"] })!.sourceId).toBe("a");
+    expect(store.nextJob(0, { channels: ["joining"], lanes: ["to_matrix channel"] })!.sourceId).toBe("c");
+    expect(store.nextJob(0, { direction: "to_matrix", channels: ["joining", "channel"] })).toBeNull();
+    expect(store.nextJob(0)!.sourceId).toBe("a");
+  });
+
+  it("finishes a job with nothing to map, keeping it deduplicated", () => {
+    const store = memory();
+    store.enqueue(job("command"));
+    store.finish(store.nextJob()!.id);
+    expect(store.counts()).toEqual({ pending: 0, failed: 0 });
+    expect(store.findMapping("to_harmony", "command", "channel", "!room:example.org")).toBeNull();
+    expect(store.enqueue(job("command"))).toBe(false);
+  });
+
+  it("keeps the sync token with its jobs and fences across restart, and replaces it whole", () => {
+    const path = file();
+    let store = open(path);
+    expect(store.syncState("@me:test")).toBeNull();
+    store.acceptSync("@me:test", "s1", ["!a:test"], [job("one")], ["!b:test"]);
+    expect(() => store.acceptSync("@me:test", "s2", [], [job("two"), job("bad", { payload: { toJSON: () => null } })], ["!c:test"])).toThrow();
+    close(store);
+    store = open(path);
+    expect(store.syncState("@me:test")).toEqual({ nextBatch: "s1", rooms: ["!a:test"] });
+    expect(store.counts().pending).toBe(1);
+    expect([store.isRoomBlocked("!b:test"), store.isRoomBlocked("!c:test")]).toEqual([true, false]);
+    store.acceptSync("@me:test", "s3", ["!a:test", "!d:test"], []);
+    expect(store.syncState("@me:test")).toEqual({ nextBatch: "s3", rooms: ["!a:test", "!d:test"] });
+    expect(store.syncState("@other:test")).toBeNull();
+    store.clearSync("@me:test");
+    expect(store.syncState("@me:test")).toBeNull();
+    expect(() => store.acceptSync("@me:test", "", [], [])).toThrow();
+  });
+
+  it("opens a 0.1.0 database and adds what it lacks, keeping its jobs and ghosts", () => {
+    const path = file();
+    const old = new DatabaseSync(path);
+    old.exec(`
+      CREATE TABLE transactions (transaction_id TEXT PRIMARY KEY NOT NULL);
+      CREATE TABLE encrypted_rooms (room_id TEXT PRIMARY KEY NOT NULL);
+      CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, direction TEXT NOT NULL CHECK(direction IN ('to_harmony', 'to_matrix')), source_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL, room_id TEXT NOT NULL, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'done', 'failed')), ready_at INTEGER NOT NULL DEFAULT 0, error TEXT, destination_id TEXT,
+        UNIQUE(direction, source_id, channel_id, room_id));
+      CREATE TABLE ghost_users (matrix_id TEXT PRIMARY KEY NOT NULL, harmony_id TEXT UNIQUE NOT NULL, registered INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE ghost_rooms (room_id TEXT NOT NULL, matrix_id TEXT NOT NULL REFERENCES ghost_users(matrix_id), PRIMARY KEY(room_id, matrix_id));
+      INSERT INTO encrypted_rooms VALUES ('!fenced:test');
+      INSERT INTO jobs(direction, source_id, channel_id, room_id, payload) VALUES ('to_harmony', '$queued', 'channel', '!room:example.org', '{"body":"hi"}');
+      INSERT INTO ghost_users VALUES ('@ghost:test', 'user', 1);
+      INSERT INTO ghost_rooms VALUES ('!room:example.org', '@ghost:test');
+    `);
+    old.close();
+    const store = open(path);
+    expect(store.ghostProfile("!room:example.org", "@ghost:test")).toBeNull();
+    store.setGhostProfile("!room:example.org", "@ghost:test", "profile");
+    expect(store.ghostProfile("!room:example.org", "@ghost:test")).toBe("profile");
+    expect(store.nextJob()!.sourceId).toBe("$queued");
+    expect(store.isRoomBlocked("!fenced:test")).toBe(true);
+    expect(store.roomGhosts("!room:example.org")).toEqual(["@ghost:test"]);
+    expect(store.syncState("@me:test")).toBeNull();
+    expect(store.invites()).toEqual([]);
+  });
+
+  it("remembers when a pair began until it is forgotten", () => {
+    const store = memory();
+    expect(store.pairStart("a", "!a", 100)).toBe(100);
+    expect(store.pairStart("a", "!a", 200)).toBe(100);
+    expect(store.pairStart("b", "!b", 300)).toBe(300);
+    store.prunePairStarts((channel, room) => channel === "b" && room === "!b");
+    expect(store.pairStart("a", "!a", 400)).toBe(400);
+    expect(store.pairStart("b", "!b", 500)).toBe(300);
+  });
+
+  it("keeps the latest 500 invites", () => {
+    const store = memory();
+    for (let index = 0; index < 510; index++) store.saveInvite({ roomId: `!${index}`, name: null, alias: null, encrypted: false });
+    store.saveInvite({ roomId: "!509", name: "Renamed", alias: "#a:test", encrypted: true });
+    expect(store.invites()).toHaveLength(500);
+    expect(store.invites()[0]).toEqual({ roomId: "!509", name: "Renamed", alias: "#a:test", encrypted: true });
+    expect([store.isInvited("!9"), store.isInvited("!10")]).toEqual([false, true]);
+    store.dropInvite("!10");
+    expect(store.isInvited("!10")).toBe(false);
+  });
 });
