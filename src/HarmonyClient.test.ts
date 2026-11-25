@@ -249,4 +249,198 @@ describe('HarmonyClient', () => {
     await connected;
     harmony.stop();
   });
+
+  it('reads member lists of up to 10,000, and one member alone', async () => {
+    const members = Array.from({ length: 10_000 }, (_, index) => ({ id: `11111111-1111-4111-8111-${String(index).padStart(12, '0')}`, username: `user${index}`,
+      display_name: 'x'.repeat(60), avatar_url: `https://storage.test/${'a'.repeat(80)}`, domain: 'harmony.test' }));
+    const fetchImpl = vi.fn<typeof fetch>(async () => Response.json(members));
+    const harmony = client(fetchImpl);
+    await expect(harmony.bridgeMembers('channel')).resolves.toHaveLength(10_000);
+    expect(String(fetchImpl.mock.calls[0][0])).toBe('https://harmony.example/bot-gateway/api/v1/channels/channel/bridge-members');
+    await harmony.bridgeMembers('channel', members[0].id);
+    expect(String(fetchImpl.mock.calls[1][0])).toBe(`https://harmony.example/bot-gateway/api/v1/channels/channel/bridge-members?user_id=${members[0].id}`);
+    fetchImpl.mockResolvedValueOnce(Response.json([...members, { ...members[0], id: '22222222-2222-4222-8222-222222222222' }]));
+    await expect(harmony.bridgeMembers('channel')).rejects.toThrow('oversized');
+  }, 20_000);
+
+  it('binds with the alias it was given and surfaces the refusal codes', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => Response.json({ room_id: '!room:test', sender_mode: 'ghost' }));
+    const harmony = client(fetchImpl);
+    await harmony.bridgeRoom('channel', { room_id: '!room:test', initial_sender_mode: 'ghost', room_alias: '#room:test' });
+    expect(JSON.parse(fetchImpl.mock.calls[0][1]!.body as string)).toEqual({ room_id: '!room:test', initial_sender_mode: 'ghost', room_alias: '#room:test' });
+    for (const code of ['room_in_use', 'room_changed']) {
+      fetchImpl.mockResolvedValueOnce(Response.json({ code, error: 'SECRET' }, { status: 409 }));
+      await expect(harmony.bridgeRoom('channel', { room_id: '!room:test', initial_sender_mode: 'ghost' })).rejects.toMatchObject({ errcode: code, transient: false });
+    }
+  });
+
+  it('surfaces an opted-out author on a send', async () => {
+    const harmony = client(vi.fn<typeof fetch>(async () => Response.json({ error: 'SECRET', code: 'BRIDGE_AUTHOR_OPTED_OUT' }, { status: 403 })));
+    await expect(harmony.sendMessage('channel', 'hello', {})).rejects.toMatchObject({ status: 403, errcode: 'BRIDGE_AUTHOR_OPTED_OUT', transient: false });
+  });
+
+  it('tells of configuration changes and of refused credentials', async () => {
+    const { server, url } = await gateway();
+    const harmony = client(undefined, url);
+    const config = vi.fn();
+    const refused = vi.fn();
+    harmony.on('config', config).on('refused', refused).on('error', () => {});
+    const connected = once(server, 'connection');
+    expect(harmony.isRunning).toBe(false);
+    harmony.start();
+    const [socket] = await connected;
+    await once(socket, 'message');
+    socket.send(JSON.stringify({ op: 0, t: 'BRIDGE_CONFIG_UPDATE', d: { bridge_id: 'b' } }));
+    await vi.waitFor(() => expect(config).toHaveBeenCalledExactlyOnceWith({ bridge_id: 'b' }));
+    expect(harmony.isRunning).toBe(true);
+    socket.close(4004, 'Invalid or expired token');
+    await vi.waitFor(() => expect(refused).toHaveBeenCalledOnce());
+    expect(harmony.isRunning).toBe(false);
+  });
+
+  it('sends member lists that changed, all of them again after READY, and none of a forgotten channel', async () => {
+    const { server, url } = await gateway();
+    const harmony = client(undefined, url);
+    const frames: any[] = [];
+    const connected = once(server, 'connection');
+    const member = { id: '@sam:test', username: 'sam', displayName: 'Sam', avatarUrl: null, source: 'matrix' as const };
+    const ready = once(harmony, 'ready');
+    harmony.start();
+    const [socket] = await connected;
+    await once(socket, 'message');
+    socket.on('message', (raw: Buffer) => { const frame = JSON.parse(raw.toString()); if (frame.op === 6) frames.push(frame.d.channels.map((channel: any) => channel.harmonyChannelId)); });
+    socket.send(JSON.stringify({ op: 0, t: 'READY', d: { heartbeat_interval: 10_000 } }));
+    await ready;
+    harmony.publishMatrixMembers('a', [member]);
+    harmony.publishMatrixMembers('a', [{ ...member }]);
+    harmony.publishMatrixMembers('b', []);
+    await vi.waitFor(() => expect(frames).toEqual([['a'], ['a', 'b']]));
+    const again = once(harmony, 'ready');
+    socket.send(JSON.stringify({ op: 0, t: 'READY', d: { heartbeat_interval: 10_000 } }));
+    await again;
+    harmony.publishMatrixMembers('a', [member]);
+    harmony.forgetMatrixMembers('a');
+    harmony.forgetMatrixMembers('a');
+    await vi.waitFor(() => expect(frames.slice(2)).toEqual([['a', 'b'], ['b']]));
+  });
+
+  it('gathers member lists that change together into one frame', async () => {
+    const { server, url } = await gateway();
+    const harmony = new HarmonyClient({ apiUrl: 'https://harmony.example', gatewayUrl: url, token: 'SECRET', memberFrameMs: 100 });
+    cleanups.push(() => harmony.stop());
+    const frames: any[] = [];
+    const connected = once(server, 'connection');
+    const ready = once(harmony, 'ready');
+    harmony.start();
+    const [socket] = await connected;
+    await once(socket, 'message');
+    socket.on('message', (raw: Buffer) => { const frame = JSON.parse(raw.toString()); if (frame.op === 6) frames.push(frame.d.channels.length); });
+    socket.send(JSON.stringify({ op: 0, t: 'READY', d: { heartbeat_interval: 10_000 } }));
+    await ready;
+    for (let index = 0; index < 20; index++) harmony.publishMatrixMembers(`channel-${index}`, []);
+    await vi.waitFor(() => expect(frames).toEqual([1, 20]));
+  });
+
+  const checkAnswer = (extra: Record<string, unknown> = {}) => ({ platform: 'matrix', room_id: '!room:test', sender_mode: 'ghost', messages_encrypted: false, relay_allowed: null, member: null, ...extra });
+  const userId = '11111111-1111-4111-8111-111111111111';
+  const member = { id: userId, username: 'alice', display_name: 'Alice', avatar_url: 'https://storage.test/a.png', domain: 'harmony.test', is_local: true };
+
+  it('reads everything a relay depends on in one request', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => Response.json(checkAnswer()));
+    const harmony = client(fetchImpl);
+    await expect(harmony.check('channel/a')).resolves.toEqual({ registered: true, roomId: '!room:test', mode: 'ghost', plaintext: true, relayAllowed: false, member: null });
+    expect(String(fetchImpl.mock.calls[0][0])).toBe('https://harmony.example/bot-gateway/api/v1/channels/channel%2Fa/bridge-check');
+    expect(fetchImpl.mock.calls[0][1]).toMatchObject({ method: 'GET', headers: { Authorization: 'Bot SECRET' }, redirect: 'error' });
+    fetchImpl.mockImplementation(async () => Response.json(checkAnswer({ relay_allowed: true, member })));
+    await expect(harmony.check('channel', userId)).resolves.toMatchObject({ relayAllowed: true, member: { id: userId, display_name: 'Alice' } });
+    expect(String(fetchImpl.mock.calls[1][0])).toBe(`https://harmony.example/bot-gateway/api/v1/channels/channel/bridge-check?user_id=${userId}`);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('takes a channel without an active binding as unregistered, and anything it does not understand as no answer', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => Response.json({ platform: null, room_id: null, sender_mode: null, messages_encrypted: null, relay_allowed: null, member: null }));
+    const harmony = client(fetchImpl);
+    await expect(harmony.check('channel', userId)).resolves.toEqual({ registered: false, roomId: null, mode: null, plaintext: false, relayAllowed: false, member: null });
+    for (const broken of [{ platform: 'discord' }, { platform: undefined }, { messages_encrypted: null }, { messages_encrypted: 'false' }, { sender_mode: 'else' }, { room_id: 'room' }, { room_id: undefined },
+      { relay_allowed: null }, { relay_allowed: 'true' }, { relay_allowed: true, member: { ...member, id: '22222222-2222-4222-8222-222222222222' } }, { relay_allowed: true, member: 'x' }]) {
+      fetchImpl.mockImplementationOnce(async () => Response.json(checkAnswer({ relay_allowed: true, ...broken })));
+      await expect(harmony.check('channel', userId), JSON.stringify(broken)).rejects.toThrow('Invalid bridge');
+    }
+    fetchImpl.mockImplementationOnce(async () => Response.json(checkAnswer({ messages_encrypted: true, relay_allowed: false, room_id: null })));
+    await expect(harmony.check('channel', userId)).resolves.toMatchObject({ plaintext: false, relayAllowed: false, roomId: null });
+    for (const status of [400, 403, 503]) {
+      fetchImpl.mockImplementationOnce(async () => Response.json({}, { status }));
+      await expect(harmony.check('channel')).rejects.toMatchObject({ status });
+    }
+    fetchImpl.mockClear();
+    await harmony.check('channel').catch(() => {});
+    expect(String(fetchImpl.mock.calls[0][0])).toContain('bridge-check');
+  });
+
+  it('falls back to the separate routes of 1.9.8, remembers it and asks the route again after a READY that has it', async () => {
+    const { server, url } = await gateway();
+    const answers: Record<string, unknown> = { 'bridge-platform': { platform: 'matrix' }, encryption: { messages_encrypted: false }, 'bridge-room': { room_id: '!room:test', sender_mode: 'ghost' },
+      [`bridge-consent/${userId}`]: { relay_allowed: true }, 'bridge-members': [member] };
+    let has = false;
+    const paths: string[] = [];
+    const harmony = client(vi.fn<typeof fetch>(async input => {
+      const path = new URL(String(input)).pathname.split('/channels/channel/')[1];
+      paths.push(path);
+      if (path === 'bridge-check') return has ? Response.json(checkAnswer({ relay_allowed: true, member })) : new Response('Cannot GET', { status: 404 });
+      return Response.json(answers[path]);
+    }), url);
+    const expected = { registered: true, roomId: '!room:test', mode: 'ghost', plaintext: true, relayAllowed: true, member: { id: userId, username: 'alice', display_name: 'Alice', avatar_url: 'https://storage.test/a.png', domain: 'harmony.test' } };
+    await expect(harmony.check('channel', userId)).resolves.toEqual(expected);
+    expect(paths).toEqual(['bridge-check', 'bridge-platform', 'encryption', 'bridge-room', `bridge-consent/${userId}`, 'bridge-members']);
+    paths.length = 0;
+    await harmony.check('channel');
+    expect(paths).toEqual(['bridge-platform', 'encryption', 'bridge-room']);
+    answers[`bridge-consent/${userId}`] = { relay_allowed: false };
+    await expect(harmony.check('channel', userId)).resolves.toMatchObject({ relayAllowed: false, member: null });
+    answers['bridge-platform'] = { platform: null };
+    await expect(harmony.check('channel', userId)).rejects.toThrow('not registered');
+
+    const connected = once(server, 'connection');
+    const ready = once(harmony, 'ready');
+    harmony.start();
+    const [socket] = await connected;
+    await once(socket, 'message');
+    socket.send(JSON.stringify({ op: 0, t: 'READY', d: { heartbeat_interval: 10_000, capabilities: ['matrix_bridge_v2', 'matrix_bridge_check'] } }));
+    await ready;
+    has = true;
+    paths.length = 0;
+    await expect(harmony.check('channel', userId)).resolves.toEqual(expected);
+    expect(paths).toEqual(['bridge-check']);
+    const again = once(harmony, 'ready');
+    socket.send(JSON.stringify({ op: 0, t: 'READY', d: { heartbeat_interval: 10_000, capabilities: ['matrix_bridge_v2'] } }));
+    await again;
+    answers['bridge-platform'] = { platform: 'matrix' };
+    paths.length = 0;
+    await harmony.check('channel');
+    expect(paths).toEqual(['bridge-platform', 'encryption', 'bridge-room']);
+  });
+
+  it('reads an unbound pair\'s room as none, and no answer to a binding as that', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => Response.json({ room_id: null, sender_mode: 'ghost' }));
+    const harmony = client(fetchImpl);
+    await expect(harmony.bridgeRoom('channel')).resolves.toEqual({ room_id: null, sender_mode: 'ghost' });
+    await expect(harmony.bridgeRoom('channel', { room_id: '!room:test', initial_sender_mode: 'ghost' })).rejects.toThrow('Invalid Matrix room binding');
+  });
+
+  it('tells who joined or left the server', async () => {
+    const { server, url } = await gateway();
+    const harmony = client(undefined, url);
+    const changed = vi.fn();
+    harmony.on('member', changed);
+    const connected = once(server, 'connection');
+    harmony.start();
+    const [socket] = await connected;
+    await once(socket, 'message');
+    for (const [t, user] of [['SERVER_MEMBER_ADD', { id: userId }], ['SERVER_MEMBER_REMOVE', { id: userId }], ['SERVER_MEMBER_ADD', { id: 'x' }], ['SERVER_MEMBER_REMOVE', null], ['SERVER_MEMBER_KICK', { id: userId }]]) {
+      socket.send(JSON.stringify({ op: 0, t, d: { server_id: 's', user } }));
+    }
+    socket.send(JSON.stringify({ op: 0, t: 'BRIDGE_CONFIG_UPDATE', d: {} }));
+    await once(harmony, 'config');
+    expect(changed.mock.calls).toEqual([[userId], [userId]]);
+  });
 });

@@ -13,10 +13,10 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: '.nvmrc'
           cache: npm
@@ -33,6 +33,13 @@ jobs:
     needs: test
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Verify standalone Docker image builds
         run: docker build -t harmony-matrix-bridge:ci .
+      - name: Unconfigured container exits with instructions
+        run: |
+          set +e
+          out=$(docker run --rm harmony-matrix-bridge:ci 2>&1)
+          code=$?
+          echo "$out"
+          test "$code" -ne 0 && echo "$out" | grep -q HARMONY_URL && echo "$out" | grep -q MATRIX_HOMESERVER_URL

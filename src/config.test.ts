@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { botUserId, configSchema, ghostUserId, ghostOwner, loadSecrets, registration } from './config.js'
+import { botUserId, configSchema, ghostUserId, ghostOwner, listAllows, loadSecrets, registration } from './config.js'
 
 export const sampleConfig = () => ({
   harmony: { apiUrl: 'https://harmony.test/bot-gateway', gatewayUrl: 'wss://harmony.test/bot-gateway/gateway', allowedUserIds: ['11111111-1111-4111-8111-111111111111'] },
@@ -50,12 +50,29 @@ describe('configuration', () => {
     expect(new RegExp(namespaces.users[0].regex).test('@harmony_relay:matrixXtest')).toBe(false)
     expect(new RegExp(namespaces.users[0].regex).test('@alice:matrix.test')).toBe(false)
     expect(namespaces.rooms).toEqual([])
-    const id = config.harmony.allowedUserIds[0]
+    const id = config.harmony.allowedUserIds![0]
     const ghost = ghostUserId(config, id)
     expect(ghostOwner(config, ghost)).toBe(id)
     expect(ghost).toBe('@harmony_relay_h_11111111111141118111111111111111:matrix.test')
     expect(new RegExp(namespaces.users[1].regex).test(ghost)).toBe(true)
     expect(new RegExp(namespaces.users[1].regex).test(ghost.replace('h_111', 'h_bad111'))).toBe(false)
     expect(ghostOwner(config, '@alice:matrix.test')).toBeNull()
+  })
+  it('takes the lists as optional and an empty one as a mistake', () => {
+    const input = sampleConfig()
+    const { allowedUserIds: _harmony, ...harmony } = input.harmony
+    const { allowedUserIds: _matrix, ...matrix } = input.matrix
+    const config = configSchema.parse({ ...input, harmony, matrix })
+    expect(config.harmony.allowedUserIds).toBeUndefined()
+    expect(listAllows(config.matrix.allowedUserIds, '@anyone:test')).toBe(true)
+    expect(listAllows(['@alice:test'], '@anyone:test')).toBe(false)
+    expect(listAllows([], '@anyone:test')).toBe(false)
+    expect(configSchema.safeParse({ ...input, matrix: { ...matrix, allowedUserIds: [] } }).success).toBe(false)
+  })
+  it('gives an ordinary account no ghosts', () => {
+    const account = { matrix: { serverName: 'matrix.test', userId: '@me:matrix.test' } }
+    expect(botUserId(account)).toBe('@me:matrix.test')
+    expect(ghostOwner(account, '@harmony_relay_h_11111111111141118111111111111111:matrix.test')).toBeNull()
+    expect(() => ghostUserId(account, '11111111-1111-4111-8111-111111111111')).toThrow('no ghosts')
   })
 })

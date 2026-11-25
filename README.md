@@ -1,164 +1,252 @@
-# Experimental Matrix bridge
+# Harmony Matrix bridge
 
-A self-run **Matrix application service with ghost and relay sender modes**, not full Matrix support
-in the Harmony client. This is the standalone service repository, separate from
-[Harmony](https://github.com/y4my4my4m/harmony), just like the Discord bridge.
+Connects Matrix rooms with channels of a [Harmony](https://github.com/y4my4my4m/harmony) server,
+in plaintext. It is a service of its own, like the
+[Discord bridge](https://github.com/y4my4my4m/harmony-discord-bridge); nothing of Matrix is built
+into the Harmony client. It is experimental.
 
-**Requires Harmony 1.9.8 or later**, which holds the Harmony side: the Matrix tab under Server
-settings → Bridges, the database migrations, consent and attachment-byte endpoints. This
-repository contains the worker, configuration, deployment and protocol tests.
+Everyone in a paired channel or room is relayed, except people who opted out: Harmony members in
+Bridge privacy, Matrix people with `!bridge-privacy`. Encrypted rooms, encrypted channels and
+rooms whose encryption cannot be read are never relayed.
 
-**Use dedicated test rooms/channels with consenting participants.** Explicit source
-allowlists remain mandatory. Harmony member-controlled relay consent is checked at
-queued delivery, in addition to the allowlist. Matrix-to-Harmony messages use native
-generalized author metadata. Encrypted participant support and in-client Matrix
-bridge setup are not implemented.
+## Ways to run it
+
+| | Matrix side | Pairs | Requires |
+|---|---|---|---|
+| Managed, application service | your own homeserver; a ghost per Harmony member, or one sender | Harmony: Server settings → Bridges → Matrix | Harmony 1.9.9 |
+| Managed, ordinary account | any homeserver, with an account's access token; one sender | the same | Harmony 1.9.9 |
+| Host | every bridge a Harmony instance runs: communities' own accounts, and the instance's connection | the same, and codes posted in rooms | Harmony 1.9.9, its operator |
+| `config.json` | your own homeserver, application service | the file, with a bot of your own | Harmony 1.9.8; opt-outs of Matrix people 1.9.9 |
+
+`BRIDGE_MODE=host` selects the host and `HARMONY_URL` the managed start. Without either the bridge reads
+`config.json`, and without that it prints instructions and exits with status 1.
+
+## Managed: application service
+
+1. In Harmony open Server settings → Bridges → Matrix, choose to run the bridge yourself and copy
+   the setup code. A code works once, for 30 minutes.
+2. Start the bridge:
+
+   ```sh
+   docker run -d --name harmony-matrix-bridge --restart unless-stopped -p 9009:9009 \
+     -v harmony-matrix-bridge-data:/data \
+     -e HARMONY_URL=https://harmony.example.org -e HARMONY_SETUP_CODE=MX-XXXX-XXXX-XXXX \
+     -e MATRIX_HOMESERVER_URL=https://matrix.example.org -e MATRIX_SERVER_NAME=example.org \
+     -e MATRIX_APPSERVICE_URL=http://bridge-host:9009 \
+     ghcr.io/y4my4my4m/harmony-matrix-bridge:latest
+   ```
+
+   From source: `npm ci && npm run build`, then `node dist/index.js` with the same environment.
+3. The first start writes `registration.json` into the data directory. Give it to the homeserver and
+   restart that: `docker cp harmony-matrix-bridge:/data/registration.json .`, and for Synapse add its
+   path to `app_service_config_files`. The file holds secrets. Until the homeserver knows it the
+   bridge keeps running, reports `matrix_registration_missing` and tries again.
+4. Invite `@harmony_relay:example.org` to the rooms, then pair them with channels in Harmony. Rooms
+   with an invite appear in the list; a public room can be paired by its ID or alias. The bridge
+   joins a room when a pair names it, and no other.
+
+`MATRIX_APPSERVICE_URL` is the bridge as the homeserver reaches it, not as your browser does. Keep the
+port away from the internet when the homeserver does not need it there: calls carry the registration's
+token and are refused without it, `/health` is open.
+
+## Managed: ordinary account
+
+For communities without a homeserver of their own. The account's name is on every message, with the
+Harmony author in front of the text; there are no ghosts.
+
+```sh
+docker run -d --name harmony-matrix-bridge --restart unless-stopped \
+  -v harmony-matrix-bridge-data:/data \
+  -e HARMONY_URL=https://harmony.example.org -e HARMONY_SETUP_CODE=MX-XXXX-XXXX-XXXX \
+  -e MATRIX_HOMESERVER_URL=https://matrix.org -e MATRIX_ACCESS_TOKEN=... \
+  ghcr.io/y4my4my4m/harmony-matrix-bridge:latest
+```
+
+The client API is found through `<MATRIX_HOMESERVER_URL>/.well-known/matrix/client`; without one the address
+itself is used.
+
+Use an account made for the bridge. Messages the account itself sends are never relayed, and the names
+of the rooms it is in are shown to the managers of the Harmony server. Direct chats (`m.direct`) and
+spaces are left out.
+
+The bridge follows `/sync` for the paired rooms alone and stores the sync token together with the
+messages it produced. A room's first response is history and is not copied; what is said while the
+bridge is stopped is copied when it starts again, up to 1000 events a room. Beyond that it reports
+`messages_skipped`. The homeserver's rate limit applies: messages wait for it in order.
+
+### Getting an access token
+
+```sh
+docker run --rm -it -e MATRIX_HOMESERVER_URL=https://matrix.example.org \
+  ghcr.io/y4my4my4m/harmony-matrix-bridge:latest node dist/index.js --login
+# from source, with MATRIX_HOMESERVER_URL in .env:
+node --env-file=.env dist/index.js --login
+```
+
+It asks for the user name and the password, which is not shown, signs in without a refresh token as the
+session "Harmony bridge" and prints the access token alone on the last line of stdout; everything else goes
+to stderr. Nothing is written to disk. The address must be https, or http on a loopback or private address.
+
+A token copied from a Matrix app's settings works only where tokens do not expire; on matrix.org they do,
+within minutes. A homeserver whose tokens expire for this sign-in too, or that offers none by password,
+is refused in words. Signing the "Harmony bridge" session out ends the token, and the bridge reports
+`matrix_token_invalid`.
+
+## Host: the bridges of a Harmony instance
+
+For operators of an instance. [Hosting Matrix bridges](https://github.com/y4my4my4m/harmony/blob/master/docs/self-host/matrix-bridges.md)
+in Harmony's documentation covers the setup: `harmony bridges add matrix` runs this image as a service next
+to the instance, and the admin panel says what it offers.
+
+| Variable | |
+|---|---|
+| `BRIDGE_MODE` | `host` |
+| `HARMONY_URL` | the bot gateway, e.g. `http://bot-gateway:3002` |
+| `HARMONY_PUBLIC_URL` | optional: the instance's public address, for what people are told |
+| `BRIDGE_HOST_SECRET` | equal to `MATRIX_BRIDGE_HOST_SECRET` of the bot gateway, at least 32 characters |
+| `DATA_DIR` | `./data`, in the image `/data` |
+| `LISTEN_HOST`, `LISTEN_PORT` | `0.0.0.0` and `9009`: `/health`, and the instance's application service |
+| `MATRIX_ALLOW_PRIVATE_HOMESERVERS` | `false`; `true` lets communities name homeservers on private addresses |
+
+The host reads its list from Harmony every minute. Bridges start, stop and take new credentials without a
+restart. A list that cannot be read changes nothing. `GET /health` answers 200 while the last reading that
+worked is less than five minutes old.
+
+- **Communities' own accounts.** Each bridge is a managed bridge with an ordinary account, in a worker thread
+  of its own with its own database below `DATA_DIR/hosted/<bridge>`, about 25 MB of memory each. One that
+  throws, loops for two minutes or exceeds its heap (192 MB) ends alone and starts again, after 5 seconds and
+  up to 5 minutes. One account serves one bridge: a second reports `account_in_use` and relays nothing.
+- **Their homeservers** are strangers' input. https only; the address connected to is public, judged at each
+  connection, by name, literal or whatever DNS answers then; no redirects; bounded answers and times; the same
+  for `.well-known`, media and avatars. Names are resolved by DNS, not by the system. With
+  `MATRIX_ALLOW_PRIVATE_HOMESERVERS` the address rule alone is off, and anyone who can set up a hosted bridge
+  can have the service ask addresses on your network. The instance's own homeserver is not restricted.
+- **The instance's connection** is one application service or one account for every server that chose it. A
+  room's events go to the bridge that pairs it. A transaction is acknowledged, and a sync token stored, when
+  every bridge it concerns has stored its part; one that cannot holds the others for a minute at most, or fails
+  three times on the same events, and then misses them (`messages_skipped`). A full queue takes the encryption
+  fences and lets the messages go.
+- **Isolation there** is inside one process: every bridge has its own database, gateway connection and queue,
+  an error nothing caught restarts the bridge it arose in, and one that belongs to no bridge ends the process.
+  Text from strangers is read in time proportional to its length. A process whose event loop stands still for
+  two minutes is ended, for its supervisor to start again.
+- **Ghosts** belong to a Harmony user, not to a server: two servers' rooms share one. They leave a room for the
+  reasons of its own pair, and an opt-out counts in its own server.
+- **Linking.** The account accepts invitations, up to 50 rooms without a code at a time. `!harmony link ML-…`
+  from someone whose power reaches what the room asks for changing its state, and its power levels
+  (`state_default`, `events["m.room.power_levels"]`; the creators in room version 12), links the room: five
+  tries a person in ten minutes, one answer each. The code is neither logged nor relayed, by any way to run the
+  bridge. A code moves a room that another server had; the account stays.
+- **Leaving.** A room without a code after ten minutes, at once an encrypted one with the reason, a room whose
+  pair is removed once every bridge has been asked whether it moved there, and after ten minutes the rooms of a
+  bridge that is no longer listed. Rooms the account was in by itself are left alone, and so are all of them
+  when the connection is turned off.
+- **Data** of a bridge that is no longer listed stays in its folder: the list cannot say whether it is gone or
+  its switch is off for an hour. Remove `DATA_DIR/hosted/<bridge>` or `DATA_DIR/instance/<bridge>` by hand,
+  with the service stopped.
+
+| Log line | Meaning |
+|---|---|
+| `Bridge list read: 2 hosted, 5 on the instance's connection` | at the start, and after a failure |
+| `Harmony refuses BRIDGE_HOST_SECRET: …` | the two secrets differ |
+| `Harmony hosts no Matrix bridges: …` | the bot gateway has no secret, or is older than 1.9.9 |
+| `Cannot read the bridge list from Harmony; retrying` | the bot gateway does not answer; what runs goes on |
+| `[1a2b3c4d] …` | one bridge, by the first characters of its ID |
+| `[instance] …` | the instance's connection |
+| `… Bridge starting`, `… Credentials changed; restarting`, `… Bridge no longer listed; stopping` | as Harmony lists them |
+| `… Bridge stopped by an error; restarting in 5 s. …` | with the place in the program, not the error's text |
+| `… Matrix homeserver connected`, `… Harmony gateway connected`, `… Pair ready` | in working order |
+| `… Cannot reach the Matrix homeserver; retrying` | or its address is not allowed (`MATRIX_ALLOW_PRIVATE_HOMESERVERS`) |
+| `… The homeserver refuses the access token. …` | a new token is needed |
+| `[instance] The homeserver does not accept the bridge yet: …` | the registration file is not on the homeserver, or an older one is |
+| `… Another bridge uses this Matrix account; nothing is relayed` | one account, two bridges |
+| `… Room linked`, `[instance] Left a room …`, `[instance] Declined …` | linking and leaving |
+| `… Messages from Matrix were not copied: …` | the bridge was down or full too long |
+| `[instance] Local storage failed; …`, `… could not start: DATA_DIR cannot be written` | check the disk |
+| `The bridge host stops after an error: …`, `The bridge host no longer responds; ending it` | the process ends; its supervisor starts it again |
+
+Logs hold no tokens, codes, messages or Matrix IDs of people.
+
+## Environment of a managed bridge
+
+| Variable | |
+|---|---|
+| `HARMONY_URL` | address of your Harmony, or of its bot gateway |
+| `HARMONY_SETUP_CODE` | first start, and to replace credentials; redeemed once |
+| `MATRIX_HOMESERVER_URL` | client API, as the bridge reaches it; with an account also the homeserver's plain address |
+| `MATRIX_SERVER_NAME` | name in user IDs (application service) |
+| `MATRIX_APPSERVICE_URL` | the bridge, as the homeserver reaches it (application service) |
+| `MATRIX_SENDER_LOCALPART` | `harmony_relay`; each bridge on one homeserver needs its own |
+| `MATRIX_AS_TOKEN`, `MATRIX_HS_TOKEN` | both or neither; generated into the data directory without them |
+| `MATRIX_ACCESS_TOKEN` | ordinary account, in place of the four above |
+| `DATA_DIR` | `./data`, in the image `/data` |
+| `LISTEN_HOST`, `LISTEN_PORT` | `0.0.0.0` and `9009`; with an account, from source, `127.0.0.1` |
+
+The data directory holds `credentials.json`, `appservice.json`, `registration.json` and
+`bridge.sqlite`, each mode 0600. `credentials.json` keeps a hash of the code, not the code. Stop the
+bridge before copying the directory; keep it with the registration, whose ghosts it owns.
+
+`GET /health` answers `{ready, pending, failed, problems}`, 200 when ready and 503 otherwise. Ready
+means: credentials accepted, gateway connected, homeserver answering, local storage writable. A pair in
+error does not change it, and no pair at all is ready too.
 
 ## What works
 
-- Multiple one-to-one Matrix room / Harmony channel pairs, either or both directions.
-- Native Matrix author attribution in Harmony, with unprefixed plaintext bodies.
-- Administrator-controlled Matrix sender mode: dedicated per-Harmony-user ghosts with
-  unprefixed text, or one AS relay sender with a Harmony author prefix.
-- Eligible, explicitly allowlisted members synchronized before first speech for mention
-  autocomplete; per-room ghost nicknames and safely mirrored avatars.
-- Real user mentions in both directions, plus an exact-username relay command.
-- Matrix rich replies linked to their original Harmony message when its mapping is known
-  and still readable; missing/private parents fall back to the new reply text alone.
-- Images and ordinary files copied in both directions into the destination's own storage,
-  including file-only messages and captions; audio/video travel as files, without transcoding.
-- Room-specific Matrix member names, fetched with the AS token, never event-supplied profiles.
-- Optional Matrix avatars via authenticated HS thumbnails and authorized Harmony storage upload.
-- Matrix application-service authentication and durable transaction acceptance.
-- SQLite inbox/outbox, event deduplication, message mappings and bounded retry backoff.
-- Matrix outbound transaction IDs stable across retries/restarts.
-- Per-attempt checks of both sides' encryption policy; unknown state fails closed.
-- Durable Matrix encryption-event fences, including events received during a preflight.
-- Explicit sender allowlists, rechecked before queued delivery.
-- Registered Matrix bridge/channel binding required at startup and every delivery.
-- Harmony per-member consent revalidated on every send attempt, including retries;
-  missing/unknown consent never allows delivery.
-- No forwarding of Harmony bots, external bridge messages, system notices or threads.
-- Health endpoint without message contents or credentials.
+- Room and channel pairs, one to one, in either or both directions. Managed pairs come and go while
+  the bridge runs; one that cannot be joined, read or bound is reported to Harmony and the others run.
+- Matrix authors in Harmony by name and avatar, with unprefixed text.
+- Harmony authors in Matrix as ghosts (application service) or through one sender, chosen per pair.
+- Ghosts appear when their member first speaks. In channels of at most 100 eligible members they are
+  prepared ahead, for mention completion.
+- User mentions in both directions.
+- Matrix rich replies, attached to the Harmony message they answer when the bridge knows it and it can
+  still be read; otherwise the new text alone.
+- Images and files in both directions, copied into the destination's own storage. Audio and video
+  travel as files.
+- `!bridge-privacy` for Matrix people, and the opt-outs of both sides.
+- A durable SQLite queue with deduplication, message mappings and bounded retries.
 
-Not implemented: Harmony-to-Matrix reply context, edits, deletions, reactions,
-presence, account linking, history migration, shared instance hosting or encrypted rooms/media.
-Matrix thread relations and edits are ignored. Ordinary Matrix replies are accepted;
-legacy plain/HTML reply quotes are stripped before forwarding or interpreting mentions.
-Harmony text, user mention parts and supported file parts are forwarded. No room/mass
-mentions are enabled by default.
+Not implemented: Harmony to Matrix reply context, edits, deletions, reactions, threads, presence,
+account linking, history import, encrypted rooms and media.
+Edits and threaded messages from Matrix are ignored.
 
-## Attachments
+## Privacy
 
-- Matrix `m.image`, `m.file`, `m.audio` and `m.video` messages become native Harmony file
-  parts, with captions when Matrix supplies a separate `filename`. A Matrix media reply
-  keeps the same readable-parent rules as a text reply. Old reply quotes are not captions.
-- Harmony text/mentions are sent first, then one Matrix event per attachment. File-only
-  ghost messages need no extra text; shared relay mode adds the Harmony author attribution.
-  Every acknowledged Matrix piece maps back to the original Harmony message for replies.
-- Transfers are capped at **50 MiB per file**, or a lower live Harmony private-bucket size
-  limit/destination upload limit. At most **20 files per Harmony message** are copied;
-  extra files get a visible notice. Each binary HTTP transfer has a 60-second client timeout.
-  Files are processed serially in bounded memory, not streamed end-to-end or transcoded.
-- Matrix downloads use the authenticated media endpoint on the configured homeserver,
-  never an arbitrary event URL. Harmony downloads use the currently readable stored message's
-  raw file-part index: room-local private `message_media` objects, or a live Drive file still
-  owned by that native author. URL-only/legacy/external attachment parts are not fetched.
-- Matrix bytes go through the Gateway's live private-bucket MIME/size policy, file-type and
-  signature checks, standard media-metadata stripping and content-addressed private storage.
-  Harmony bytes are also metadata-stripped before Matrix upload. This is not a malware
-  scanner: ordinary documents/archives can still contain unsafe content. Active formats such
-  as SVG, HTML, scripts and executables, unknown MIME types and mismatched image bytes are
-  refused. Other formats' metadata is not guaranteed to be removable.
-- Unsupported, oversized, missing or permanently failed copies produce an explicit
-  `[Attachment unavailable: filename]` notice, retaining accompanying text. Transient media
-  failures retry with bounded backoff before falling back. Consent, binding, sender mode and
-  both encryption policies are rechecked before upload/send; a policy refusal blocks delivery,
-  rather than turning revoked material into a notice. Encrypted media descriptors in a
-  plaintext room get a notice without downloading ciphertext or keys; encrypted rooms stay blocked.
-- Queued attachment descriptors hold bounded references, not media bytes or signed download URLs. Matrix
-  piece transaction IDs and senders are stable across retries. Repeated Matrix uploads may
-  leave unreferenced media; interrupted/revoked transfers may also leave private Harmony
-  uploads or Matrix uploads that were never posted. No media-specific orphan sweeper is added.
-  Consent cannot atomically cancel a network request already in flight, and it does not erase
-  previously copied files or historical messages. Normal platform retention/storage rules apply.
+- Harmony asks nobody to opt in: members are relayed unless they opted out in Bridge privacy. Their
+  consent is read before every send, retries included, and never cached. Anything but a clear yes sends
+  nothing.
+- Matrix people send `!bridge-privacy` in a paired room: `opt-out`, `opt-in`, `status`, `erase`. It
+  covers every room bridged to that Harmony server. `erase` deletes their messages on Harmony after
+  `erase confirm`. The command is never relayed.
+- Matrix has no reply that only one person sees. The answer is a notice in the room, as a reply to the
+  command, mentioning the person who sent it. A person gets five answers a minute and a room twenty;
+  a choice made beyond the room's limit still counts.
+- The bridge keeps the server's opt-out list and drops those people's messages on arrival and again at
+  delivery. Harmony refuses them as well (403 `BRIDGE_AUTHOR_OPTED_OUT`), which the bridge takes as an
+  opt-out. They are left out of member lists and mentions.
+- An opt-out does not call back a request already sent, and does not erase what was copied; `erase` does
+  that on Harmony.
+- Explicit lists remain possible in `config.json`. They narrow who is relayed and replace no opt-out.
 
-Encrypted room and encrypted-media support is follow-up work in [`ROADMAP.md`](./ROADMAP.md):
-real participant crypto, safe device/key persistence and recovery, media verification, and
-explicit consent for the plaintext trust boundary. Do not disable encryption to bridge a room.
+## Encryption
 
-## Bridge ecosystem parity
+The bridge reads plaintext and sends plaintext. Consent, binding, room, sender mode and both sides' encryption
+are read twice for every attempt, at its start and right before the send, the destination's last. What the
+bridge knows by itself (fences, pairs, lists, opt-outs) is looked at once more in the same turn as the send. Only `404 M_NOT_FOUND` for `m.room.encryption` counts as an unencrypted room, and
+only a boolean from Harmony as an answer about a channel. An `m.room.encryption` event of a paired room
+is a durable fence: queued and running deliveries of that room stop, and pairing it again does not lift
+it. A pair whose room or channel is encrypted is reported and its ghosts leave.
 
-The creator's [Harmony Discord bridge](https://github.com/y4my4my4m/harmony-discord-bridge)
-is the feature/UX reference (reviewed at `fd8801e`). Prefer the same Harmony message,
-identity, privacy and settings contracts where semantics match, not a fork of the
-Discord runtime or a platform-neutral framework built before another bridge needs it.
+Checks and sends are separate requests. A room that turns on encryption after the last check, while a
+send is under way, cannot be fenced by this client. Do not use the bridge for rooms that may become
+encrypted and must not leak.
 
-| Area | Matrix status / remaining parity work |
-|---|---|
-| Authors, members, user mentions | Native generalized authors, ghosts/shared relay, read-only external profiles and explicit user mentions work. No inferred native roles or account linking. |
-| Attachments | Destination-owned copies, captions, multiple files and visible failures work. Discord's configurable aggregate budget, resized images and link fallback are not identical to Matrix's per-file cap/private-copy policy. Never leak signed URLs just to match a fallback. |
-| Replies | Matrix → Harmony works, including every acknowledged outbound attachment piece. Harmony → Matrix context remains open. |
-| Message lifecycle | Edits, deletes/redactions and reactions remain open; preserve current permissions, consent, moderation and durable mappings when adding them. |
-| Threads, emoji and formatting | Threads, custom emoji/sticker fidelity, richer formatting and channel references remain open. Do not treat Matrix thread relations as ordinary replies. |
-| Setup and operations | Per-pair manager mode and health work. Guided installation/pairing, hosting choices, richer diagnostics and hot pair configuration remain open. Matrix AS registration still needs the homeserver operator. |
-| Presence and permissions | Presence and structure/role synchronization need separate product/security decisions. Matrix power levels must not automatically grant Harmony rights. |
-| Encryption | Separately scoped follow-up; Discord text channels are not a template for Matrix device/session/media crypto. Current plaintext fences stay in force. |
+Encrypted rooms and media are follow-up work in [`ROADMAP.md`](./ROADMAP.md). Do not turn encryption off
+to bridge a room.
 
-Near-term parity priorities are outbound reply context, permission-aware message lifecycle
-and reactions, and clearer setup/diagnostics; threads are their own feature. Keep SQLite
-acceptance, frozen senders, explicit allowlists and live consent rather than copying weaker
-loss/retry behavior for superficial parity. This table records gaps, not a claim that they ship.
+## config.json
 
-## Requirements
-
-- Node.js 24 recommended (minimum 22.13; Node 22 may print an SQLite experimental warning).
-- A Harmony instance with the generalized-author/bridge-consent DB migrations applied
-  and the matching Gateway endpoints described below. Older/unregistered bots fail
-  clearly at startup, rather than silently posting anonymous or spoofed authors.
-- A dedicated Harmony bot installed with **Read messages** and **Send messages** only
-  in explicitly scoped dedicated channels, then operator-registered with
-  `configure_matrix_bridge(p_bot_id, p_server_id, p_channel_ids uuid[])`. An authorized
-  server manager runs this RPC; it sets `bot_type = 'bridge'`, platform `matrix`, and
-  replaces that server's channel bindings. The relay does not register itself in the DB.
-  Do not grant the bot Manage Server, roles or messages.
-- A Matrix homeserver whose administrator can register an application service.
-  A public Matrix account without homeserver administration is useful as a test user,
-  but is not sufficient to host this application service.
-- A reachable callback address from the homeserver to the relay. The relay needs
-  outbound access to that homeserver and the Harmony gateway.
-
-**Pre-merge test deployments:** the three bridge migrations were renumbered from
-`20261109100001`–`20261109100003` to `20261111100001`–`20261111100003` to follow upstream
-without version collisions. If you applied the old versions, do not blindly replay the
-renamed files: reconcile the existing bridge objects, migration history and intervening
-upstream migrations first. No automatic upgrade or database reset is performed.
-
-The Matrix bridge reserves a dedicated AS sender such as `@harmony_relay:example.org`
-and a dedicated ghost namespace. It never impersonates existing Matrix users. In
-`relay` mode Harmony messages arrive through the AS sender with the Harmony author's
-name in the text. In `ghost` mode they arrive unprefixed from a stable per-Harmony-UUID
-Matrix account, with that room's nickname/avatar. Matrix messages arrive
-through the Harmony bot with an **unprefixed** body and
-`metadata.bridge_author = { platform: "matrix", id: "@full:mxid", username: "full", display_name?, avatar_url? }`.
-`username` is the bounded Matrix localpart; the full MXID is the stable identity. Names are
-bounded to 100 characters, IDs to 255, avatar references/URLs to 2048. Missing or
-invalid optional fields are omitted; inaccessible/non-joined member state prevents
-sending (transient fetch failures retry). Event-supplied author/profile metadata is ignored.
-
-## Moving an existing monorepo deployment
-
-Stop the old worker before relocating it; do not run two workers against one database.
-Preserve the private `config.json`, `.env`, `registration.json` and a consistent SQLite
-backup (including any required WAL/sidecar state), not just the source code. Relative
-`databasePath` values resolve from the new working directory: point to the existing
-state rather than accidentally starting with an empty database and lost mappings.
-Keep the AS/HS tokens, bot identity, room bindings and ghost namespace unchanged.
-No automated deployment or state migration is performed by this repository split.
-
-## Local setup
-
-Clone this standalone repository:
+For a bot of your own, with everything in one file. A pair that cannot be verified stops the start.
 
 ```sh
 git clone https://github.com/y4my4my4m/harmony-matrix-bridge.git
@@ -169,215 +257,214 @@ cp .env.example .env
 chmod 600 config.json .env
 ```
 
-Populate `config.json`:
-
-- `harmony.apiUrl`: gateway base, e.g. `https://chat.example.org/bot-gateway`.
+- `harmony.apiUrl`: the gateway, e.g. `https://chat.example.org/bot-gateway`.
 - `harmony.gatewayUrl`: e.g. `wss://chat.example.org/bot-gateway/gateway`.
-- `harmony.allowedUserIds`: Harmony profile UUIDs eligible for relay, additionally
-  subject to their current native bridge-consent setting.
-- `matrix.homeserverUrl`: actual client API URL, which may differ from the user-ID domain.
-- `matrix.serverName`: the server name in Matrix user IDs (e.g. `example.org`).
-- `matrix.applicationServiceUrl`: callback URL reachable **from the homeserver**.
-- `matrix.allowedUserIds`: consenting Matrix users' full IDs, not display names.
-- `pairs`: actual Harmony channel UUID / Matrix room ID pairs. Room IDs are opaque:
-  older rooms commonly use `!opaque:server`; modern rooms may use `!opaque` without
-  a server suffix. Use the complete ID returned by Matrix, not a room alias.
-  Directions are `both`, `to_harmony` and `to_matrix`.
-- `pairs[].senderMode`: `ghost` or `relay`, used **only for the first DB room binding**.
-  Omitted means `relay` for old configurations; the example explicitly selects `ghost`.
-  Once bound, the administrator's current DB mode wins, even after restart. Both
-  allowlists are mandatory and capped at 1000 IDs; DB eligibility does not override them.
+- `harmony.allowedUserIds`, `matrix.allowedUserIds`: optional. Absent, everyone who has not opted out;
+  present, these Harmony profile UUIDs or full Matrix IDs only, 1 to 1000.
+- `matrix.homeserverUrl`: client API; may differ from the domain of user IDs.
+- `matrix.serverName`: the server name in user IDs.
+- `matrix.senderLocalpart`: default `harmony_relay`.
+- `matrix.applicationServiceUrl`: the bridge, as the homeserver reaches it.
+- `listen.host`, `listen.port`: default `127.0.0.1` and `9009`.
+- `database`: default `./data/bridge.sqlite`, relative to the working directory.
+- `pairs`: 1 to 100 of `harmonyChannelId` and `matrixRoomId`, each used once. Room IDs, not aliases;
+  newer ones have no server suffix. `direction` is `both`, `to_harmony` or `to_matrix`.
+- `pairs[].senderMode`: `relay` (default) or `ghost`, for the first binding. After that the mode set in
+  Harmony counts.
 
-Use HTTPS/WSS across untrusted networks. Plain HTTP/WS is supported for trusted
-local development or a private container network; the configured endpoints carry
-credentials. Never put tokens into URLs.
-
-Populate `.env` **locally**, not in chat or an issue:
+In `.env`:
 
 ```dotenv
-HARMONY_TOKEN=harmony_bot_<64 hex characters issued by Harmony>
-MATRIX_AS_TOKEN=<first independently generated random token>
-MATRIX_HS_TOKEN=<second independently generated random token>
+HARMONY_TOKEN=harmony_bot_<64 hex characters>
+MATRIX_AS_TOKEN=<openssl rand -hex 32>
+MATRIX_HS_TOKEN=<openssl rand -hex 32, another one>
 ```
 
-Generate each Matrix token separately with `openssl rand -hex 32`.
-The AS token authorizes the relay to Matrix; the HS token authorizes homeserver
-callbacks to the relay. Keep them distinct.
-
-Generate the private application-service registration:
-
-```sh
-npm run registration
-```
-
-This writes `registration.json` (mode `0600`) and refuses to overwrite an existing
-file. JSON is valid YAML. Give this file to your homeserver administrator, add its
-path to Synapse's `app_service_config_files`, and restart/reload Synapse as required.
-The file's `url` must be reachable from Synapse, not just from your browser. This
-registration reserves the exact AS sender plus the exclusive namespace
-`@<senderLocalpart>_h_<32 lowercase UUID hex digits>:<serverName>`. It claims no
-room/alias namespace. Existing installations must update their homeserver AS
-registration with this namespace before enabling ghost mode; preserve the AS/HS tokens.
-The generator refuses to overwrite a registration file, so generate/review a separate
-private file rather than deleting working secrets. No credentials are printed.
-
-Invite `@harmony_relay:<serverName>` to the selected **unencrypted** Matrix rooms.
-Start the bridge:
+The bot needs **Read messages** and **Send messages** in the paired channels and nothing more. Its owner,
+who also manages the server, connects it in Server settings → Bridges → Matrix, which records
+`bots.bridge_platform = 'matrix'` and the channels. `configure_matrix_bridge` is the function behind that
+page (migrations `20261117900001` to `20261117900003`).
 
 ```sh
+npm run registration      # registration.json, never overwritten
 npm run build
 node --env-file=.env dist/index.js
-# or, during development:
-npm run dev
 ```
 
-On startup it first verifies **every** configured channel is registered to this
-Matrix bridge, registers the AS sender if needed, binds each configured room through
-Gateway without overriding an existing admin mode, leaves owned ghosts from removed
-pairs, joins rooms, verifies encryption state, connects to Harmony and starts the worker. An ordinary bot,
-missing migration/endpoint, encrypted, inaccessible or unverifiable pairing aborts startup.
-There is no fallback to the old prefix-based inbound format.
+Register `registration.json` with the homeserver and invite `@harmony_relay:<serverName>` to the rooms.
 
-`GET http://127.0.0.1:9009/health` reports `ready`, `pending` and `failed`. `ready`
-means Matrix startup completed and Harmony's gateway is connected; it is not a
-continuous guarantee that every room is accessible. Every delivery rechecks access
-and encryption independently. A failed count needs operator attention.
+On Harmony 1.9.9 the bot's Matrix people can opt out as well: lists are read per paired channel, since a
+bot may serve several servers. An older Harmony answers the command with a notice that it cannot.
 
-Harmony members can withdraw relay consent through the native server bridge-privacy
-setting. Consent is queried **after enqueue, immediately before every Harmony-to-Matrix
-send attempt**, so pending/retry jobs cannot bypass a later opt-out. False or malformed
-consent rejects the job; an unavailable endpoint sends nothing and may retry later.
-The operator can additionally remove an ID from either allowlist and restart, or
-remove channel bindings/revoke permissions to stop a pairing. Already copied messages
-are not retracted. To stop all forwarding, stop the process/revoke the bot tokens.
+## Sender modes, members and mentions
 
-## Sender modes, member sync and mentions
+Ghost IDs are `@<senderLocalpart>_h_<32 hex digits of the profile UUID>:<serverName>`, in an exclusive
+namespace of the registration. A managed bridge or a host takes over a ghost it does not know, after its data
+was lost, when the homeserver confirms that the application service acts as that user. With `config.json` it
+is refused. A ghost that cannot be had fails the message and is reported (`ghosts_unavailable`), without
+falling back to the single sender.
 
-Ghost IDs are stable per Harmony UUID, not nickname. The bridge persists ownership,
-registration and joined-room tracking in additive SQLite tables. Unknown pre-existing
-Matrix accounts are **not adopted**: a namespace/collision/registration refusal fails
-closed with no silent relay fallback. Keep the SQLite database with the AS registration.
-If a crash loses registration confirmation after Matrix accepted it, recovery may require
-operator ownership review; do not clear ownership rows to bypass a collision.
+A ghost is joined and named when its profile in the room is not the one last put there, and otherwise only
+speaks; one that was removed from the room is prepared again, once, when its message is refused. A public room
+is joined as it is; the bridge invites a ghost where the join is refused, and needs the right to there.
 
-Every READY requests a complete refresh. The same single worker refreshes pairs round-
-robin, targeting one full sweep per 30 seconds (long network/provisioning work can extend
-that interval); no overlapping async sync loops run. Both sides must be verified
-plaintext before fetching/publishing profiles. Native candidates are intersected with
-`harmony.allowedUserIds`, then current consent is checked again before provisioning and
-profile exposure. Matrix imports are intersected with `matrix.allowedUserIds`, excluding
-the AS sender and **all** owned ghosts, then published through authenticated WS op 6.
-Every op-6 update contains the complete per-channel snapshot, including explicit empty
-channel lists, because the Gateway replaces all registered channels on each frame.
-Member lists are capped at 1000 and pairs at 100; oversized lists fail closed rather than
-partially inventing a directory. Large first-time syncs can delay queued delivery.
+A pair is refreshed when it becomes ready, on every READY, and when something changed: the configuration or an
+opt-out, the members or profiles of the room, the members of the Harmony server, gathered for 30 seconds each.
+Without any sign of a change it is refreshed every ten minutes; a room of more than 1000 people is listed no
+more often than that. A refresh verifies that both sides are plaintext, lets ghosts of members who left or
+opted out leave, prepares ghosts where channels are small, and publishes the room's members to Harmony (op 6):
+at most 1000 of them, with avatars copied ahead in rooms of at most 100. Every frame holds every channel, since
+the gateway replaces the whole registration; lists that did not change are not sent again, and frames are 15
+seconds apart.
 
-Ghosts leave on observed member removal/opt-out or `ghost`→`relay`; removed pairs are
-cleaned at startup. History is not deleted. Changes are observed at the next successful
-refresh, not instantaneously; unavailable endpoints cannot promise immediate cleanup.
-Messages always recheck consent independently of that refresh. A Matrix sender is frozen
-in SQLite before its first send attempt because Matrix transaction deduplication is
-sender-scoped. If the admin mode changes before a retry, the job fails rather than
-resending from another identity. It never silently changes a frozen sender.
+Ghosts leave on member removal, opt-out, the change from ghost to relay, and when their pair is removed
+or stops in error. History stays. A message's Matrix sender is stored before its first attempt, because
+Matrix deduplicates per sender; a mode change before a retry fails the message rather than sending it
+from someone else.
 
-- Matrix→Harmony: only `m.text`, explicit `m.mentions.user_ids`, and validated
-  `https://matrix.to/#/<MXID>` pills can produce native user mention parts. Targets must
-  be durably confirmed owned ghosts resolving to currently eligible, allowlisted native
-  members; a matching-but-unknown colliding MXID is not a mention target. HTML
-  is never forwarded or fetched. HTML/plaintext disagreement preserves the plain body;
-  explicit annotated targets without a usable pill are appended as native mention parts.
-  Plain display names and unannotated pills never guess or ping a user.
-- In relay mode, send `!mention <exact_native_username> <message>` to mention one
-  eligible Harmony member. Ambiguous/unknown names stay plain text. This is a literal
-  text command, **not a slash command**; relay mode offers no native-user slash autocomplete.
-- Harmony→Matrix consumes structured `mention` parts for Matrix targets:
-  `{ type: "mention", userId: "@sam:example.org", username: "sam", domain: "example.org",
-     isLocal: false, isBridged: true, bridgeSource: "matrix" }`.
-  Targets must be allowlisted and currently joined. Native UUID mentions can also resolve
-  to eligible joined ghosts in ghost mode. The bridge emits escaped HTML `matrix.to`
-  links plus `m.mentions.user_ids`, never room mentions. Unresolved targets stay text.
-  The frontend marker is `<@matrix:ENCODED_MXID>` with `encodeURIComponent(fullMXID)`;
-  this process consumes structured parts, not raw marker strings. Discord tokens are unchanged.
+- Matrix to Harmony: `m.text`, with `m.mentions.user_ids` and `https://matrix.to/#/<MXID>` links of
+  ghosts the bridge owns becoming mentions of their members. HTML is neither forwarded nor fetched; when
+  it disagrees with the plain text, the plain text counts.
+- `!mention <exact_username> <message>` mentions one Harmony member in rooms without ghosts. It is text,
+  not a slash command.
+- Harmony to Matrix: structured mention parts (`userId`, `bridgeSource: "matrix"`, `isBridged: true`)
+  become links and `m.mentions.user_ids` of people joined to the room, at most 50 a message. Members'
+  mentions become their ghosts'. No room mentions.
 
-## Gateway contracts and avatars
+## Attachments
 
-All endpoints use `Authorization: Bot <token>`; paths below are under `/api/v1`:
+- `m.image`, `m.file`, `m.audio` and `m.video` become Harmony file parts, with a caption when Matrix
+  supplies a `filename` beside the body.
+- Harmony text goes first, then one Matrix event per file. In relay mode a file-only message gets the
+  author's line.
+- 50 MiB per file, or the destination's lower limit; 20 files per Harmony message, then one visible
+  notice. 60 seconds per transfer, one at a time, in memory.
+- Matrix files come through the homeserver's authenticated media endpoint. Harmony files are read by
+  message and part index from the channel's own private media; URL-only, external and Drive attachments
+  are not (the gateway answers 422 for Drive files).
+- Harmony checks type, signature and size and strips metadata before storing. This is no malware
+  scanner. SVG, HTML, scripts, executables and mismatched images are refused.
+- A file that is unsupported, too large, missing or cannot be copied becomes
+  `[Attachment unavailable: name]` beside the text. Consent, binding, sender mode and both encryption
+  states are checked before each step; a refusal there stops the message instead.
+- Encrypted file descriptors in a plaintext room get the notice; nothing is downloaded.
+- Queued messages hold references, not bytes or signed URLs. Interrupted transfers can leave uploads
+  that nothing refers to.
 
-- `GET /channels/:channelId/bridge-platform` → `{ platform: "matrix" | "discord" | null }`.
-  Read permission and authoritative DB registration checks are required; unavailable
-  registration state must return 503, not pretend the bot is registered.
-- `GET /channels/:channelId/bridge-consent/:userId` → `{ relay_allowed: boolean }`.
-  Gateway verifies the paired bridge and the member's current setting. Unknown is
-  false; unavailable checks fail closed. This is never cached by the relay.
-- `PUT /channels/:channelId/bridge-room` with
-  `{ room_id: "!opaque", initial_sender_mode: "ghost" | "relay" }` → `{ room_id, sender_mode }`.
-  `GET` on the same path returns the fresh authoritative binding/mode. A mismatched
-  bound room fails closed. A bind must never overwrite an existing administrator mode.
-- `GET /channels/:channelId/bridge-members` → an array of eligible accepted,
-  channel-visible, opted-in native `{ id, username, display_name, avatar_url, domain }`.
-- `GET /channels/:channelId/bridge-members/:userId/avatar` → `{ data, content_type }`,
-  at most 1 MiB decoded, from the instance's own avatar bucket only and only for a
-  currently eligible member. The relay never fetches a native `avatar_url` itself.
-- `GET /channels/:channelId/encryption` → `{ messages_encrypted: boolean }`.
-- `POST /channels/:channelId/bridge-avatar` accepts
-  `{ data: "<base64, at most 1 MiB decoded>", content_type: "image/png|image/jpeg|image/webp|image/gif" }`
-  and returns `{ avatar_url: "<full public Harmony storage URL>" }`. Gateway must require
-  a registered Matrix bridge and scoped read/send permission, validate bytes/MIME/size,
-  and use existing `avatars` storage with content-addressed
-  `bridges/<bot-id>/<sha256>.<ext>` paths. This relay adds no storage credentials or API.
+## Delivery
 
-Matrix `mxc://` images cannot be rendered directly by a plain browser with modern
-Matrix authenticated media. The relay accepts only bounded MXC references from the
-sender's actual room-member state. It requests a 128×128 thumbnail through the
-**configured homeserver only**, using the AS bearer header and the standard
-`/_matrix/client/v1/media/thumbnail/{server}/{mediaId}` route. It never fetches arbitrary
-external profile URLs, follows redirects, puts tokens in URLs, or exposes a media proxy.
-Responses have a 15-second deadline, a 1 MiB streaming limit, and a raster MIME allowlist.
-The HS may federate MXC media according to its own policy; secure that server separately.
+- One process per database. A channel's messages go in order, one at a time in each direction, retries
+  included; up to four channels are worked on at once, without waiting for a tick.
+- A Matrix transaction is acknowledged, and a sync token stored, only with its events in SQLite. Events
+  are deduplicated by ID. A queue of 10,000 refuses more until it drains.
+- A transaction may hold 8 MiB. An event that cannot be read is left out, an encryption event still fences
+  its room. A transaction that cannot be read at all is refused twice and then let go, since the homeserver
+  would repeat it for ever and send nothing after it.
+- Events sent before a managed pair existed are not copied, whenever the homeserver delivers them; five
+  minutes of clock difference are allowed.
+- Harmony's WebSocket has no replay: what Harmony members say while the bridge is disconnected is not
+  copied.
+- A Harmony POST has no idempotency key. An unclear failure after it started is marked failed, not
+  retried; a crash between acceptance and completion can duplicate one message.
+- Matrix sends keep their transaction ID across retries and restarts. For an account they deduplicate per
+  device: a new access token is a new device.
+- Transient failures are retried seven times, up to a minute apart. A rate limit or a refused token from
+  Matrix pauses Harmony to Matrix and costs no attempt. Messages dropped for an opt-out count as `failed`.
+- A failed write to local storage stops the worker until restart.
+- Finished jobs keep IDs and no content. The database, its sidecars and backups hold queued plaintext;
+  keep them private.
 
-Both room/channel plaintext checks precede profile/media fetch and upload; destination
-encryption is checked again afterward, with the durable Matrix encryption fence before
-message send. A 256-entry in-memory MXC→uploaded-URL cache avoids repeated successful
-uploads. Native avatars use the trusted byte endpoint above and authenticated Matrix
-media upload, with a separate bounded 256-entry cache keyed by member and avatar URL.
-No arbitrary native/external avatar URL is fetched. Avatar fetch/upload errors still
-deliver text: new ghosts omit the avatar, existing ghosts preserve their previous avatar
-on optional failures, and an actual native avatar removal clears it. External/invalid
-Matrix avatar references are ignored. Gateways without
-this optional upload endpoint still relay text, but **not avatars**. Public copied
-avatars are not deleted by an opt-out or retracted when the Matrix original disappears.
-Native cached copies follow avatar URL changes; an overwrite at the same storage URL
-requires a bridge restart to refresh. This is profile mirroring, not media lifecycle sync.
+## Gateway contracts
+
+`Authorization: Bot <token>`. Below `/bridge/v2/matrix` (Harmony 1.9.9):
+
+- `POST /redeem` `{code}` → `{bridge_id, server_id, harmony_token, base_url, api_url, gateway_url}`.
+- `GET /config` → `{bridge_id, server_id, mode, updated_at, privacy_version, pairs: [{channel_id,
+  channel_name, room_id, room_alias, direction, sender_mode, encrypted}]}`, read every minute, on READY and
+  on `BRIDGE_CONFIG_UPDATE`.
+- `POST /status` `{version, connection, ready, user_id, homeserver, server_name, pending, failed, rooms,
+  pairs, problems}`, every 30 seconds and after changes. Rooms are sent when ready: joined ones first,
+  then invites (`invited: true`), 500 in all.
+- `GET /privacy/optouts` → `{version, remote_user_ids}`; `GET`, `PUT`, `DELETE /privacy/optouts/:mxid`;
+  `POST /privacy/erase` `{user_id}`. A bot that no managed bridge owns names the channel with
+  `?channel_id=`.
+
+With `X-Bridge-Host-Secret`, for the host:
+
+- `GET /host` → `{hosted: [{bridge_id, harmony_token, homeserver_url, access_token}], instance}`, where
+  `instance` is null or `{connection, homeserver_url, server_name, sender_localpart, as_token, hs_token,
+  access_token, bridges: [{bridge_id, harmony_token}]}`.
+- `POST /host/status` `{version, instance: {ready, user_id, server_name, problems} | null, hosted}`.
+- `POST /host/link` `{code, room_id, sender}` → `{bridge_id, server_name, channel_id, channel_name}`, 400
+  `invalid_code`, 409 `channel_encrypted`.
+
+Below `/api/v1`:
+
+- `GET /channels/:id/bridge-check?user_id=` → `{platform, room_id, sender_mode, messages_encrypted,
+  relay_allowed, member}`: everything a send depends on, at one moment (Harmony 1.9.9, READY capability
+  `matrix_bridge_check`). A text message costs two of these and a known ghost nothing more. Without it the
+  bridge asks the five routes below instead.
+- `GET /channels/:id/bridge-platform` → `{platform}`; 503 when unknown.
+- `GET /channels/:id/bridge-consent/:userId` → `{relay_allowed}`: true unless the member opted out. The
+  route checks read access to the channel, not its pairing.
+- `GET`, `PUT /channels/:id/bridge-room` → `{room_id, sender_mode}`. `PUT` takes `room_id`,
+  `initial_sender_mode` and, for a pair named by alias, `room_alias`. 409 `room_in_use` and `room_changed`.
+- `GET /channels/:id/bridge-members` → accepted members who see the channel and did not opt out, at most
+  10,000; `?user_id=` for one of them (Harmony 1.9.9).
+- `GET /channels/:id/bridge-members/:userId/avatar` → `{data, content_type}`, at most 1 MiB, from the
+  instance's own storage. The bridge never fetches a member's `avatar_url`.
+- `GET /channels/:id/encryption` → `{messages_encrypted}`.
+- `POST /channels/:id/bridge-avatar` `{data, content_type}` → `{avatar_url}`, at most 1 MiB of PNG, JPEG,
+  WebP or GIF, stored under `avatars/bridges/<bot>/<server>/<sha256>`: 1000 per bot and server, purged an
+  hour after the binding ends.
+- `POST /channels/:id/messages` with `metadata.bridge_author = {platform: "matrix", id, username,
+  display_name?, avatar_url?}`. Names up to 100 characters, IDs 255, avatar URLs 2048; the gateway drops
+  avatar URLs that are not https.
+
+Matrix avatars are fetched as 128×128 thumbnails through the configured homeserver only, at most 1 MiB, and
+copied into Harmony's storage once per server. A failed copy is tried again after ten minutes and never
+holds up a message. Copied avatars are not removed by an opt-out.
 
 ## Docker
 
-Build locally; no official Matrix bridge image is published by this contribution:
+`ghcr.io/y4my4my4m/harmony-matrix-bridge`, or `docker build -t harmony-matrix-bridge .`. The image runs as
+`node`, keeps its data in the volume `/data`, listens on `0.0.0.0:9009` and has a health check.
+
+With `config.json`, set `listen.host` to `0.0.0.0` and mount the file and a directory for the database:
 
 ```sh
-docker build -t harmony-matrix-bridge:dev .
+mkdir -p data && chmod 700 data
+docker run --rm --name harmony-matrix-bridge --network matrix-net --user "$(id -u):$(id -g)" \
+  --env-file .env -v "$PWD/config.json:/app/config.json:ro" -v "$PWD/data:/app/data" \
+  ghcr.io/y4my4my4m/harmony-matrix-bridge:latest
 ```
 
-For container use, set `listen.host` to `0.0.0.0` and choose an application-service
-URL reachable from the homeserver (for example a service DNS name on a shared
-private Docker network). Do not expose the callback port publicly without need.
-A process listening on container loopback is not reachable from other containers.
+## Moving a deployment
 
-With a private Docker network named `matrix-net` already configured:
+Stop the bridge first; two workers must not share a database. Keep `config.json`, `.env`,
+`registration.json` and the database with its `-wal` and `-shm` files. A relative `database` resolves from
+the new working directory. Keep tokens, bot, room bindings and ghost namespace. A 0.1.0 database is
+extended in place.
 
-```sh
-mkdir -p data
-chmod 700 data
-docker run --rm --name harmony-matrix-bridge \
-  --network matrix-net --user "$(id -u):$(id -g)" \
-  --env-file .env \
-  -v "$PWD/config.json:/app/config.json:ro" \
-  -v "$PWD/data:/app/data" \
-  harmony-matrix-bridge:dev
-```
+Changing from an application service to an account leaves its ghosts in their rooms: remove the pairs
+first, so that they leave.
 
-The user override lets the process read the private bind-mounted config and write
-its database as your UID. Adjust ownership explicitly if using a different service
-account. The example's relative database path resolves to `/app/data/bridge.sqlite`.
+## Compared with the Discord bridge
+
+The [Discord bridge](https://github.com/y4my4my4m/harmony-discord-bridge) (2.8.0) is the reference for
+behaviour and settings.
+
+| Area | Matrix |
+|---|---|
+| Setup | Setup code, hosted account, the instance's connection, pairs, status and problems in Server settings, as there. |
+| Authors, members, mentions | Authors with name and avatar, ghosts or one sender, profiles and user mentions. No roles, no account linking. |
+| Privacy | The same opt-outs and erase; a text command instead of a slash command. |
+| Attachments | Copies on both sides with captions, several files and visible failures. Fixed limits, no link fallback. |
+| Replies | Matrix to Harmony, every sent piece included. Harmony to Matrix is open. |
+| Edits, deletions, reactions | Open. |
+| Threads, emoji, formatting | Open. |
+| Presence, permissions | Open. Matrix power levels give no rights on Harmony. |
+| Encryption | Plaintext only on both. |
 
 ## Tests
 
@@ -385,103 +472,23 @@ account. The example's relative database path resolves to `/app/data/bridge.sqli
 npm run type-check
 npm test
 npm run build
-npm audit
-```
-
-The tests cover authenticated transaction handling, queue atomicity/restarts,
-deduplication, encryption rejection, sender/pair restrictions, retry scheduling,
-protocol requests, reconnect/shutdown behavior, required bridge registration, room-member
-profiles, invalid/oversized avatars, avatar failures, encryption-before-upload ordering,
-opt-out between enqueue/retry and delivery, ghost ownership/collision handling,
-frozen sender modes, two-user provisioning, member import restrictions, real mentions,
-file-only/caption/multi-file delivery, bounded authenticated media, visible transfer failures,
-per-piece reply mappings and policy changes during media transfers.
-
-For a real **local Synapse** protocol smoke test (Docker, Linux host networking):
-
-```sh
 npm run test:synapse
 ```
 
-The harness creates private temporary configuration and random tokens, binds only
-loopback ports, runs its own uniquely named Synapse container, and removes only
-that container and its temporary files on completion. It leaves the downloaded
-image in Docker's cache. It pulls Synapse `latest` and runs the resolved immutable
-digest, which it reports for reproducibility. No account credentials are needed.
-
-It exercises actual AS registration, joins, authenticated transactions, room-member
-state, authenticated media thumbnails, Matrix send idempotency, and the plaintext-to-
-encrypted-room transition. A local **Gateway contract fake** additionally exercises
-registration rejection, generalized authors, avatar upload, queued member opt-out,
-**two real Synapse ghosts**, per-room nickname/avatar, WS member publication, real
-mentions both ways, idempotent ghost sends, relay mode, ghost leaves on opt-out/mode
-change, retained history, attachment uploads/downloads in both directions, captions, file replies,
-media-failure notices, and refusal to retry a frozen transaction under another sender. It does **not** test Gateway
-storage/byte validation or DB registration/consent against a real Harmony database,
-and does not claim encrypted message interoperability.
-
-## Delivery and privacy limits
-
-- Run **one process per database**; queue selection is intentionally single-worker.
-- Synapse transactions are acknowledged only after SQLite acceptance. Event IDs, not
-  transaction receipts, deduplicate jobs even if a homeserver reuses transaction IDs
-  after restart; new encryption fences are always processed atomically. Previously
-  acknowledged events dropped by older versions are not automatically recovered.
-  Queues are bounded to 10,000 pending jobs;
-  a full queue refuses new Matrix transactions rather than acknowledging their loss.
-- Harmony's WebSocket has no resume/replay. Events missed while disconnected are
-  not recovered. Storage/queue failures receiving Harmony events are logged, but
-  Harmony cannot replay those events automatically.
-- Harmony POST has no idempotency key. Ambiguous network/5xx failures after starting
-  a send are marked failed, **not blindly retried** (a rate-limit rejection may retry).
-  A crash after acceptance but before local completion can still produce a duplicate
-  on restart. This is **not exactly-once delivery**.
-- Jobs are processed in ready-ID order; a delayed retry can be overtaken by later jobs.
-- Retries are bounded; terminal failures are counted, not silently replayed forever.
-- Database contents are sensitive: pending jobs contain plaintext messages and sender
-  IDs. Keep the database, sidecars and backups private. Receipts/mappings are retained
-  for deduplication; completed/failed jobs clear their payloads. SQLite pages, WAL files
-  and backups may retain older data; this is not secure erasure. Monitor disk usage.
-  Encryption at rest is not provided here.
-- Storage read/write faults pause the worker and refuse new Matrix transactions;
-  inspect storage and restart rather than continuing with uncertain queue state.
-- Consent/registration and sends are separate remote operations too: an opt-out or
-  permission revocation after the final check cannot cancel an already-started send.
-- There is a residual encryption-policy race: checks and sends are separate remote
-  operations. Matrix encryption events durably block a room, and the destination is
-  checked last, but a transition after the final check or while an HTTP send is already
-  in flight cannot be atomically fenced by this client. Do not use this plaintext
-  milestone for sensitive rooms that may transition to encryption. Atomic destination
-  enforcement/participant crypto must precede that use case.
-- No cross-platform encryption guarantee exists. The bridge must eventually be a
-  participant trusted with plaintext, not a tunnel for interchangeable ciphertext.
-
-## Next integration work
-
-The maintainer's intended model is a **revocable participant**: bridge keys, room
-membership and permissions should have the same lifecycle as a user's. Harmony
-and Matrix both using Megolm does not make their key distribution, device identity,
-trust or history-sharing rules interoperable.
-
-Before supporting encrypted rooms, implement a participant-crypto adapter on each
-side: independent device/session stores, authorized key acquisition, decryption and
-reencryption, membership/revocation handling and queued-send reauthorization. Use
-those systems' supported key-sharing rules; do not copy ciphertext between them or
-weaken existing guards. Revocation prevents future access/delivery; like a user, a
-bridge cannot be made to forget plaintext/keys it already received by simply removing
-its permissions.
-
-Before a community-facing release, validate the Gateway/DB registration, native-author,
-consent and avatar-storage contracts together on a deployed instance, and add Matrix
-bridge setup in Harmony settings. Keep the existing Discord API compatible. This
-relay does not rename Discord tables, introduce a shared bridge SDK or alter encryption policy.
+`npm run test:synapse` needs Linux and Docker. It pulls Synapse, runs it with random tokens on loopback
+ports in a container of its own and removes that container and its files at the end; bot-gateway is a
+contract fake. It drives the application service (registration, transactions, ghosts, media, mentions,
+replies, fences), the managed start (refused registration, invites, pairs that come and go, privacy
+command, restart, removal, encryption), account mode (`--login`, first sync, limited timelines, removal and
+return, fences) and the host as a process of its own (a hosted account behind `.well-known` and https, two
+servers on one application service, links by code, a room that moves, encrypted rooms, lost data, the
+instance's account). It tests neither Harmony's database nor its storage.
 
 ## License
 
-AGPL-3.0, consistent with Harmony. Protocol/transport patterns are adapted from the
-reference [harmony-discord-bridge](https://github.com/y4my4my4m/harmony-discord-bridge)
-by Harmony's contributors. [Powered by Harmony](https://github.com/y4my4my4m/harmony).
-See [LICENSE](./LICENSE), [COPYRIGHT](./COPYRIGHT),
-[additional terms](./LICENSE-ADDITIONAL-TERMS.md) and [trademark policy](./TRADEMARK.md).
-The original Harmony notices are retained unchanged; the UI/assets they describe are
-not bundled with this headless service.
+AGPL-3.0, consistent with Harmony. Protocol and transport patterns follow
+[harmony-discord-bridge](https://github.com/y4my4my4m/harmony-discord-bridge) by Harmony's contributors.
+[Powered by Harmony](https://github.com/y4my4my4m/harmony). See [LICENSE](./LICENSE),
+[COPYRIGHT](./COPYRIGHT), [additional terms](./LICENSE-ADDITIONAL-TERMS.md) and
+[trademark policy](./TRADEMARK.md). The original Harmony notices are kept unchanged; the UI and assets
+they describe are not bundled with this headless service.

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { configSchema, ghostUserId } from './config.js'
 import { Store, StorageError } from './Store.js'
+import { separateCheck, type BridgeCheck, type SeparateChecks } from './HarmonyClient.js'
 import { Relay, type MatrixEvent } from './Relay.js'
 import { HttpError } from './http.js'
 import { MAX_MEDIA_BYTES } from './Media.js'
@@ -18,7 +19,9 @@ function setup() {
   })
   const store = new Store(':memory:')
   stores.push(store)
-  const harmony = { sendMessage: vi.fn().mockResolvedValue({ id: 'h-copy' }), canReplyTo: vi.fn().mockResolvedValue(true), channelIsPlaintext: vi.fn().mockResolvedValue(true),
+  // The separate routes of Harmony 1.9.8; bridge-check has its own tests.
+  const harmony = { check: vi.fn((channelId: string, userId?: string, named?: boolean): Promise<BridgeCheck> => separateCheck(harmony as unknown as SeparateChecks, channelId, userId, named)),
+    sendMessage: vi.fn().mockResolvedValue({ id: 'h-copy' }), canReplyTo: vi.fn().mockResolvedValue(true), channelIsPlaintext: vi.fn().mockResolvedValue(true),
     requireMatrixBridge: vi.fn().mockResolvedValue(undefined), relayAllowed: vi.fn().mockResolvedValue(true),
     uploadBridgeAvatar: vi.fn().mockResolvedValue('https://storage.test/avatar.png'),
     bridgeRoom: vi.fn().mockResolvedValue({ room_id: roomId, sender_mode: 'relay' }),
@@ -327,7 +330,8 @@ describe('Relay', () => {
     harmony.uploadBridgeAvatar.mockImplementation(async () => { order.push('upload'); return 'https://storage.test/avatar.png' })
     relay.acceptTransaction('one', [event()])
     await relay.tick()
-    expect(order).toEqual(['matrix', 'harmony', 'profile', 'upload', 'harmony'])
+    // The destination is read last, after everything else that is awaited.
+    expect(order).toEqual(['harmony', 'matrix', 'profile', 'upload', 'matrix', 'harmony'])
     expect(harmony.sendMessage.mock.calls[0][2].bridge_author.avatar_url).toBe('https://storage.test/avatar.png')
     relay.acceptTransaction('two', [event({ event_id: '$two' })])
     await relay.tick()
@@ -336,7 +340,7 @@ describe('Relay', () => {
   })
   it('bounds the successful avatar cache and refetches evicted MXC references', async () => {
     const { relay, harmony, matrix } = setup()
-    for (let index = 0; index <= 256; index++) {
+    for (let index = 0; index <= 2048; index++) {
       matrix.roomMember.mockResolvedValue({ avatar_mxc: `mxc://test/image${index}` })
       relay.acceptTransaction(`txn${index}`, [event({ event_id: `$event${index}` })])
       await relay.tick()
@@ -344,8 +348,8 @@ describe('Relay', () => {
     matrix.roomMember.mockResolvedValue({ avatar_mxc: 'mxc://test/image0' })
     relay.acceptTransaction('again', [event({ event_id: '$again' })])
     await relay.tick()
-    expect(matrix.avatarThumbnail).toHaveBeenCalledTimes(258)
-    expect(harmony.uploadBridgeAvatar).toHaveBeenCalledTimes(258)
+    expect(matrix.avatarThumbnail).toHaveBeenCalledTimes(2050)
+    expect(harmony.uploadBridgeAvatar).toHaveBeenCalledTimes(2050)
   })
   it.each(['fetch', 'upload'])('still sends text when optional avatar %s fails', async failure => {
     const { relay, harmony, matrix } = setup()
@@ -382,7 +386,7 @@ describe('Relay', () => {
   it('provisions two eligible ghosts before speech and publishes only allowlisted Matrix members', async () => {
     const { relay, harmony, matrix, config, store } = setup()
     const second = '33333333-3333-4333-8333-333333333333'
-    config.harmony.allowedUserIds.push(second)
+    config.harmony.allowedUserIds!.push(second)
     harmony.bridgeRoom.mockResolvedValue({ room_id: roomId, sender_mode: 'ghost' })
     harmony.bridgeMembers.mockResolvedValue([
       { id: userId, username: 'Alice', display_name: 'Room Alice', avatar_url: 'https://harmony.test/a.png', domain: 'harmony.test' },
@@ -533,7 +537,7 @@ describe('Relay', () => {
   it('excludes every owned ghost from inbound echo even if explicitly allowlisted', () => {
     const { relay, config, store } = setup()
     const ghost = ghostUserId(config, userId)
-    config.matrix.allowedUserIds.push(ghost)
+    config.matrix.allowedUserIds!.push(ghost)
     relay.acceptTransaction('echo', [event({ sender: ghost })])
     expect(store.counts().pending).toBe(0)
   })
@@ -561,7 +565,7 @@ describe('Relay', () => {
   it('does not ping an unknown colliding ghost in either direction, while relay !mention still works', async () => {
     const { relay, harmony, matrix, config } = setup()
     const other = '33333333-3333-4333-8333-333333333333'
-    config.harmony.allowedUserIds.push(other)
+    config.harmony.allowedUserIds!.push(other)
     const unknownGhost = ghostUserId(config, other)
     harmony.bridgeMembers.mockResolvedValue([
       { id: userId, username: 'Alice', display_name: 'Alice', avatar_url: null, domain: 'harmony.test' },

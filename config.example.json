@@ -1,15 +1,13 @@
 {
   "harmony": {
     "apiUrl": "https://harmony.example.com/bot-gateway",
-    "gatewayUrl": "wss://harmony.example.com/bot-gateway/gateway",
-    "allowedUserIds": ["11111111-1111-4111-8111-111111111111"]
+    "gatewayUrl": "wss://harmony.example.com/bot-gateway/gateway"
   },
   "matrix": {
     "homeserverUrl": "https://matrix.example.com",
     "serverName": "example.com",
     "senderLocalpart": "harmony_relay",
-    "applicationServiceUrl": "http://127.0.0.1:9009",
-    "allowedUserIds": ["@alice:example.com"]
+    "applicationServiceUrl": "http://127.0.0.1:9009"
   },
   "listen": { "host": "127.0.0.1", "port": 9009 },
   "database": "./data/bridge.sqlite",

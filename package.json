@@ -1,8 +1,8 @@
 {
   "name": "@harmony/matrix-bridge",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "Experimental self-run Matrix application-service relay for Harmony",
+  "description": "Experimental Matrix bridge for Harmony: application service, ordinary account, or the bridges of an instance",
   "license": "AGPL-3.0",
   "type": "module",
   "engines": {

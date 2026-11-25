@@ -1,7 +1,12 @@
+.git
+.github
 node_modules
 dist
+dev
 data
 config.json
 registration.json
+*.log
 .env
-.git
+.env.*
+Dockerfile

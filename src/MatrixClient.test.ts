@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ResponseTooLarge } from './http.js';
 import { MatrixClient } from './MatrixClient.js';
 
 function setup() {
@@ -118,20 +119,104 @@ describe('MatrixClient', () => {
     await expect(client.registerGhost('@outsider:matrix.example', true)).rejects.toThrow('outside dedicated ghost namespace');
   });
 
+  it('takes over a ghost it does not know where that is allowed, once the homeserver owns that it is the service\'s', async () => {
+    const ghost = '@relay_h_11111111111141118111111111111111:matrix.example';
+    const fetchImpl = vi.fn<typeof fetch>();
+    const client = new MatrixClient({ homeserverUrl: 'https://matrix.example', asToken: 'SECRET', botUserId: '@relay:matrix.example', adoptsGhosts: true, fetchImpl });
+    const inUse = () => Response.json({ errcode: 'M_USER_IN_USE' }, { status: 400 });
+    fetchImpl.mockResolvedValueOnce(inUse()).mockResolvedValueOnce(Response.json({ user_id: ghost }));
+    await expect(client.registerGhost(ghost, false)).resolves.toBeUndefined();
+    expect(String(fetchImpl.mock.calls[1][0])).toContain(`/account/whoami?user_id=${encodeURIComponent(ghost)}`);
+    for (const who of [Response.json({ user_id: '@relay:matrix.example' }), Response.json({ errcode: 'M_FORBIDDEN' }, { status: 403 }), Response.json({})]) {
+      fetchImpl.mockResolvedValueOnce(inUse()).mockResolvedValueOnce(who);
+      await expect(client.registerGhost(ghost, false)).rejects.toMatchObject({ transient: false });
+    }
+    fetchImpl.mockResolvedValueOnce(Response.json({ errcode: 'M_EXCLUSIVE' }, { status: 400 }));
+    await expect(client.registerGhost(ghost, false)).rejects.toMatchObject({ errcode: 'M_EXCLUSIVE' });
+    fetchImpl.mockClear();
+    for (const other of ['@alice:matrix.example', '@relay_h_1111:matrix.example', '@relay_h_11111111111141118111111111111111:elsewhere.example', '@relay_h_alice:matrix.example']) {
+      await expect(client.registerGhost(other, false)).rejects.toThrow('outside dedicated ghost namespace');
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('knows who may change a room', async () => {
+    const { client, fetchImpl } = setup();
+    const alice = '@alice:example';
+    const may = async (create: unknown, levels: unknown) => {
+      fetchImpl.mockImplementation(async input => {
+        const path = String(input);
+        if (path.includes('/state/m.room.create')) { expect(path).toContain('format=event'); return Response.json(create); }
+        return levels === null ? Response.json({ errcode: 'M_NOT_FOUND' }, { status: 404 }) : Response.json(levels);
+      });
+      return client.mayChangeRoom('!room:example', alice);
+    };
+    const made = (room_version: string, sender = '@owner:example', extra = {}) => ({ type: 'm.room.create', sender, content: { room_version, ...extra } });
+    for (const [levels, allowed] of [
+      [{ users: { [alice]: 100 } }, true], [{ users: { [alice]: 50 } }, true], [{ users: { [alice]: 49 } }, false], [{}, false], [{ users: { '@bob:example': 100 } }, false],
+      [{ users_default: 50 }, true], [{ users: { [alice]: 0 }, users_default: 100 }, false], [{ users: { [alice]: 50 }, state_default: 75 }, false], [{ users: { [alice]: 0 }, state_default: 0 }, true],
+      [{ users: { [alice]: 50 }, events: { 'm.room.power_levels': 100 } }, false], [{ users: { [alice]: 100 }, events: { 'm.room.power_levels': 100 } }, true],
+      [{ users: { [alice]: 60 }, state_default: 75, events: { 'm.room.power_levels': 0 } }, false], [{ users: { [alice]: '100' } }, true],
+      [{ users: { [alice]: 'all' } }, false], [{ users: { [alice]: null } }, false], [{ users: { [alice]: 50 }, state_default: 'none' }, false], [{ users: { [alice]: 100 }, state_default: null }, false],
+      [{ users: { [alice]: 100 }, events: { 'm.room.power_levels': 'x' } }, false], [{ users: [alice] }, false], [{ users: { [alice]: 1e400 } }, false],
+    ] as Array<[unknown, boolean]>) expect(await may(made('11'), levels), JSON.stringify(levels)).toBe(allowed);
+    // A creator has no more power than the levels say, before room version 12.
+    expect(await may(made('11', alice), { users: { [alice]: 0 } })).toBe(false);
+    expect(await may(made('11', alice), null)).toBe(true);
+    expect(await may(made('11'), null)).toBe(false);
+    expect(await may(made('12', alice), { users: {} })).toBe(true);
+    expect(await may(made('12', '@owner:example', { additional_creators: [alice] }), { state_default: 100 })).toBe(true);
+    expect(await may(made('12'), { users: { [alice]: 10 } })).toBe(false);
+    expect(await may(made('11', '@owner:example', { additional_creators: [alice] }), { users: {} })).toBe(false);
+    fetchImpl.mockImplementation(async () => Response.json({ errcode: 'M_FORBIDDEN' }, { status: 403 }));
+    await expect(client.mayChangeRoom('!room:example', alice)).rejects.toThrow();
+  });
+
+  it('leaves a room, with a reason where there is one', async () => {
+    const { client, fetchImpl } = setup();
+    fetchImpl.mockImplementation(async () => Response.json({}));
+    await client.leaveRoom('!room:example', 'why');
+    await client.leaveRoom('!room:example');
+    expect(fetchImpl.mock.calls.map(call => [String(call[0]).includes('/rooms/!room%3Aexample/leave?user_id=%40relay'), call[1]!.body])).toEqual([[true, '{"reason":"why"}'], [true, '{}']]);
+  });
+
   it('invites and joins ghosts with room-specific profiles, not global profiles', async () => {
     const { client, fetchImpl } = setup();
     const ghost = '@relay_h_11111111111141118111111111111111:matrix.example';
     fetchImpl.mockResolvedValueOnce(Response.json({ errcode: 'M_NOT_FOUND' }, { status: 404 }))
+      .mockResolvedValueOnce(Response.json({ errcode: 'M_FORBIDDEN' }, { status: 403 }))
       .mockResolvedValueOnce(Response.json({})).mockResolvedValueOnce(Response.json({})).mockResolvedValueOnce(Response.json({}));
     await client.joinGhost('!room:example', ghost, { displayname: 'Room Nick', avatar_url: 'mxc://matrix.example/a' });
-    expect(String(fetchImpl.mock.calls[1][0])).toContain('/invite?user_id=%40relay%3A');
-    expect(JSON.parse(fetchImpl.mock.calls[1][1]!.body as string)).toEqual({ user_id: ghost });
-    expect(String(fetchImpl.mock.calls[2][0])).toContain(`user_id=${encodeURIComponent(ghost)}`);
-    expect(JSON.parse(fetchImpl.mock.calls[3][1]!.body as string)).toEqual({ membership: 'join', displayname: 'Room Nick', avatar_url: 'mxc://matrix.example/a' });
+    expect(String(fetchImpl.mock.calls[1][0])).toContain(`/join/!room%3Aexample?user_id=${encodeURIComponent(ghost)}`);
+    expect(String(fetchImpl.mock.calls[2][0])).toContain('/invite?user_id=%40relay%3A');
+    expect(JSON.parse(fetchImpl.mock.calls[2][1]!.body as string)).toEqual({ user_id: ghost });
+    expect(String(fetchImpl.mock.calls[3][0])).toContain(`/join/!room%3Aexample?user_id=${encodeURIComponent(ghost)}`);
+    expect(JSON.parse(fetchImpl.mock.calls[4][1]!.body as string)).toEqual({ membership: 'join', displayname: 'Room Nick', avatar_url: 'mxc://matrix.example/a' });
     fetchImpl.mockResolvedValueOnce(Response.json({ event_id: '$ghost-event' }));
     await client.sendMessage('!room:example', 'txn', 'Hi Sam', { sender: ghost, userIds: ['@sam:example'], formattedBody: 'Hi <a href="https://matrix.to/#/%40sam%3Aexample">Sam</a>' });
-    expect(String(fetchImpl.mock.calls[4][0])).toContain(`user_id=${encodeURIComponent(ghost)}`);
-    expect(JSON.parse(fetchImpl.mock.calls[4][1]!.body as string)).toMatchObject({ 'm.mentions': { user_ids: ['@sam:example'] }, format: 'org.matrix.custom.html' });
+    expect(String(fetchImpl.mock.calls[5][0])).toContain(`user_id=${encodeURIComponent(ghost)}`);
+    expect(JSON.parse(fetchImpl.mock.calls[5][1]!.body as string)).toMatchObject({ 'm.mentions': { user_ids: ['@sam:example'] }, format: 'org.matrix.custom.html' });
+  });
+
+  it('joins a ghost to a public room without an invite, and invites for no other refusal than a forbidden join', async () => {
+    const { client, fetchImpl } = setup();
+    const ghost = '@relay_h_11111111111141118111111111111111:matrix.example';
+    const paths = () => fetchImpl.mock.calls.map(call => new URL(String(call[0])).pathname.replace(/.*\/v3\//, ''));
+    fetchImpl.mockResolvedValueOnce(Response.json({ errcode: 'M_NOT_FOUND' }, { status: 404 })).mockResolvedValueOnce(Response.json({})).mockResolvedValueOnce(Response.json({}));
+    await client.joinGhost('!room:example', ghost, { displayname: 'Nick' });
+    expect(paths().filter(path => path.includes('invite'))).toEqual([]);
+    expect(paths()[1]).toBe('join/!room%3Aexample');
+    for (const [status, errcode] of [[429, 'M_LIMIT_EXCEEDED'], [404, 'M_NOT_FOUND'], [502, 'M_UNKNOWN']] as const) {
+      fetchImpl.mockClear();
+      fetchImpl.mockResolvedValueOnce(Response.json({ errcode: 'M_NOT_FOUND' }, { status: 404 })).mockResolvedValueOnce(Response.json({ errcode }, { status }));
+      await expect(client.joinGhost('!room:example', ghost, { displayname: 'Nick' })).rejects.toMatchObject({ status });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    }
+    fetchImpl.mockClear();
+    fetchImpl.mockResolvedValueOnce(Response.json({ errcode: 'M_NOT_FOUND' }, { status: 404 }))
+      .mockResolvedValueOnce(Response.json({ errcode: 'M_FORBIDDEN' }, { status: 403 })).mockResolvedValueOnce(Response.json({ errcode: 'M_FORBIDDEN' }, { status: 403 }));
+    await expect(client.joinGhost('!room:example', ghost, { displayname: 'Nick' })).rejects.toMatchObject({ status: 403 });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 
   it('preserves the room avatar when refresh bytes are unavailable, but clears an explicit removal', async () => {
@@ -207,5 +292,168 @@ describe('MatrixClient', () => {
     const { client, fetchImpl } = setup();
     fetchImpl.mockResolvedValue(Response.json({}));
     await expect(client.sendMessage('room', 'txn', 'body')).rejects.toThrow('Invalid Matrix message response');
+  });
+
+  function account(fetchImpl = vi.fn<typeof fetch>()) {
+    return { fetchImpl, client: new MatrixClient({ homeserverUrl: 'https://matrix.example', asToken: 'SECRET', botUserId: '@me:example', account: true, fetchImpl }) };
+  }
+  const missing = () => Response.json({ errcode: 'M_NOT_FOUND' }, { status: 404 });
+
+  it('acts as an ordinary account without impersonation, and has no ghosts', async () => {
+    const { client, fetchImpl } = account();
+    fetchImpl.mockResolvedValueOnce(Response.json({ event_id: '$event' })).mockResolvedValueOnce(Response.json({ user_id: '@me:example' }));
+    await client.sendMessage('!room:example', 'txn', 'hello', { sender: '@me:example' });
+    expect(String(fetchImpl.mock.calls[0][0])).toBe('https://matrix.example/_matrix/client/v3/rooms/!room%3Aexample/send/m.room.message/txn');
+    await expect(client.whoami()).resolves.toBe('@me:example');
+    for (const ghostly of [() => client.registerGhost('@me_h_11111111111141118111111111111111:example', false),
+      () => client.joinGhost('!room', '@me_h_11111111111141118111111111111111:example', { displayname: 'x' }),
+      () => client.sendMessage('!room', 'txn', 'x', { sender: '@me_h_11111111111141118111111111111111:example' })]) await expect(ghostly()).rejects.toThrow('no ghosts');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('answers a person with a notice that replies to them', async () => {
+    const { client, fetchImpl } = setup();
+    fetchImpl.mockResolvedValue(Response.json({ event_id: '$event' }));
+    await client.sendMessage('!room', 'txn', 'done', { notice: true, userIds: ['@a:example'], replyTo: '$ask' });
+    expect(JSON.parse(fetchImpl.mock.calls[0][1]!.body as string)).toEqual({ msgtype: 'm.notice', body: 'done', 'm.mentions': { user_ids: ['@a:example'] }, 'm.relates_to': { 'm.in_reply_to': { event_id: '$ask' } } });
+  });
+
+  it('proves it may act as its sender', async () => {
+    const { client, fetchImpl } = setup();
+    fetchImpl.mockResolvedValueOnce(Response.json({ user_id: '@relay:matrix.example' })).mockResolvedValueOnce(Response.json({ user_id: '@else:matrix.example' }))
+      .mockResolvedValueOnce(Response.json({ errcode: 'M_UNKNOWN_TOKEN' }, { status: 401 }));
+    await client.verifySender();
+    await expect(client.verifySender()).rejects.toThrow('cannot own');
+    await expect(client.verifySender()).rejects.toMatchObject({ status: 401, errcode: 'M_UNKNOWN_TOKEN' });
+  });
+
+  it('resolves an alias and joins through its servers and the room\'s own', async () => {
+    const { client, fetchImpl } = account();
+    fetchImpl.mockResolvedValueOnce(Response.json({ room_id: '!room:other.test', servers: ['a.test', 42, 'b.test'] })).mockResolvedValueOnce(Response.json({ room_id: '!room:other.test' }));
+    const resolved = await client.resolveAlias('#town:other.test');
+    expect(resolved).toEqual({ roomId: '!room:other.test', servers: ['a.test', 'b.test'] });
+    expect(String(fetchImpl.mock.calls[0][0])).toBe('https://matrix.example/_matrix/client/v3/directory/room/%23town%3Aother.test');
+    await client.joinRoom(resolved.roomId, resolved.servers);
+    const url = new URL(String(fetchImpl.mock.calls[1][0]));
+    expect(url.searchParams.getAll('via')).toEqual(['a.test', 'b.test', 'other.test']);
+    expect(url.searchParams.getAll('server_name')).toEqual(['a.test', 'b.test', 'other.test']);
+    fetchImpl.mockResolvedValueOnce(Response.json({ room_id: 'https://evil.test' }));
+    await expect(client.resolveAlias('#town:other.test')).rejects.toThrow('Invalid Matrix room alias');
+  });
+
+  it('reads its own membership and takes a refusal as none', async () => {
+    const { client, fetchImpl } = account();
+    for (const [body, status, expected] of [[{ membership: 'join' }, 200, 'join'], [{ membership: 'ban' }, 200, 'ban'], [{ membership: 'odd' }, 200, null], [{ errcode: 'M_FORBIDDEN' }, 403, null], [{ errcode: 'M_NOT_FOUND' }, 404, null]] as const) {
+      fetchImpl.mockResolvedValueOnce(Response.json(body, { status }));
+      await expect(client.membership('!room')).resolves.toBe(expected);
+    }
+    expect(String(fetchImpl.mock.calls[0][0])).toContain('/state/m.room.member/%40me%3Aexample');
+    fetchImpl.mockResolvedValueOnce(Response.json({}, { status: 503 }));
+    await expect(client.membership('!room')).rejects.toThrow();
+  });
+
+  it.each([
+    [null, undefined, true],
+    [{}, undefined, true],
+    [{ events_default: 50 }, undefined, false],
+    [{ events_default: 50, users: { '@me:example': 50 } }, undefined, true],
+    [{ events: { 'm.room.message': 10 }, users_default: 5 }, undefined, false],
+    [{ events: { 'm.room.message': 0 }, events_default: 50 }, undefined, true],
+    [{ events_default: '50', users: { '@me:example': '50' } }, undefined, true],
+    [{ events_default: 50 }, { type: 'm.room.create', sender: '@me:example', content: { room_version: '12' } }, true],
+    [{ events_default: 50 }, { sender: '@else:example', content: { room_version: '12', additional_creators: ['@me:example'] } }, true],
+    [{ events_default: 50 }, { sender: '@me:example', content: { room_version: '11' } }, false],
+  ])('reads from power levels %j and creation %j whether it may send: %s', async (levels, create, expected) => {
+    const { client, fetchImpl } = account();
+    fetchImpl.mockImplementation(async input => String(input).includes('power_levels') ? (levels ? Response.json(levels) : missing()) : create ? Response.json(create) : missing());
+    await expect(client.canSend('!room')).resolves.toBe(expected);
+  });
+
+  it('describes a room for the list, bounding its name, and leaves spaces out', async () => {
+    const { client, fetchImpl } = account();
+    const states: Record<string, unknown> = { 'm.room.name': { name: ` Town\u202e\u0000 ${'x'.repeat(200)}` }, 'm.room.canonical_alias': { alias: 'not an alias' } };
+    fetchImpl.mockImplementation(async input => {
+      const url = String(input);
+      if (url.includes('joined_members')) return Response.json({ joined: { '@a:example': {}, '@b:example': {} } });
+      const type = Object.keys(states).find(name => url.includes(`/state/${name}/`));
+      return type ? Response.json(states[type]) : missing();
+    });
+    const info = await client.roomInfo('!room:example');
+    expect(info).toMatchObject({ room_id: '!room:example', alias: null, encrypted: false, can_send: true, members: 2 });
+    expect(info!.name).toMatch(/^Town x+$/);
+    expect(info!.name).toHaveLength(100);
+    states['m.room.encryption'] = { algorithm: 'm.megolm.v1.aes-sha2' };
+    await expect(client.roomInfo('!room:example')).resolves.toMatchObject({ encrypted: true });
+    states['m.room.create'] = { type: 'm.space' };
+    await expect(client.roomInfo('!room:example')).resolves.toBeNull();
+  });
+
+  it('counts the members of large rooms and does not know those of huge ones', async () => {
+    const { client, fetchImpl } = account();
+    const members = (count: number) => Response.json({ joined: Object.fromEntries(Array.from({ length: count }, (_, index) => [`@person${index}:example`, { display_name: 'x'.repeat(40) }])) });
+    fetchImpl.mockImplementation(async input => String(input).includes('joined_members') ? members(5_000) : missing());
+    await expect(client.roomMembers('!room')).resolves.toHaveLength(5_000);
+    fetchImpl.mockImplementation(async input => String(input).includes('joined_members') ? members(120_000) : missing());
+    await expect(client.roomMembers('!room')).rejects.toBeInstanceOf(ResponseTooLarge);
+    await expect(client.roomInfo('!room')).resolves.toMatchObject({ members: null });
+  }, 20_000);
+
+  it('knows the account\'s direct chats', async () => {
+    const { client, fetchImpl } = account();
+    fetchImpl.mockResolvedValueOnce(Response.json({ '@a:example': ['!dm1', 42], '@b:example': 'x' })).mockResolvedValueOnce(missing()).mockResolvedValueOnce(Response.json({ joined_rooms: ['!a', 'bad', '!b'] }));
+    await expect(client.directRooms()).resolves.toEqual(new Set(['!dm1']));
+    await expect(client.directRooms()).resolves.toEqual(new Set());
+    await expect(client.joinedRooms()).resolves.toEqual(['!a', '!b']);
+  });
+
+  it('long polls with its own time and size limits, and reads each room\'s events', async () => {
+    const { client, fetchImpl } = account();
+    const body = 'x'.repeat(2 * 1024 * 1024);
+    fetchImpl.mockResolvedValueOnce(Response.json({ filter_id: '7' })).mockResolvedValueOnce(Response.json({ next_batch: 's2', rooms: {
+      join: { '!a:example': { timeline: { events: [{ type: 'm.room.message', content: { body } }], limited: true, prev_batch: 'p' }, state: { events: [{ type: 'm.room.encryption' }] } }, 'bad id': {} },
+      invite: { '!b:example': { invite_state: { events: [{ type: 'm.room.name' }] } } }, leave: { '!c:example': {} } } }));
+    await expect(client.createFilter({ room: {} })).resolves.toBe('7');
+    const batch = await client.sync({ filter: '7', since: 's1', timeoutMs: 30_000 });
+    const url = new URL(String(fetchImpl.mock.calls[1][0]));
+    expect(Object.fromEntries(url.searchParams)).toEqual({ filter: '7', since: 's1', timeout: '30000', set_presence: 'offline' });
+    expect(fetchImpl.mock.calls[1][1]).toMatchObject({ headers: { Authorization: 'Bearer SECRET' }, redirect: 'error' });
+    expect(batch.nextBatch).toBe('s2');
+    expect([...batch.joined.keys()]).toEqual(['!a:example']);
+    expect(batch.joined.get('!a:example')).toMatchObject({ timeline: { limited: true, prev_batch: 'p' }, state: [{ type: 'm.room.encryption' }] });
+    expect(batch.invited.get('!b:example')).toEqual([{ type: 'm.room.name' }]);
+    expect(batch.left).toEqual(['!c:example']);
+    fetchImpl.mockResolvedValueOnce(Response.json({ next_batch: 's3', filler: 'x'.repeat(17 * 1024 * 1024) }));
+    await expect(client.sync({ filter: '7', timeoutMs: 0 })).rejects.toBeInstanceOf(ResponseTooLarge);
+    fetchImpl.mockResolvedValueOnce(Response.json({}));
+    await expect(client.sync({ filter: '7', timeoutMs: 0 })).rejects.toThrow('Invalid Matrix sync response');
+  }, 20_000);
+
+  it('waits past the poll\'s own timeout, and can be called off', async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, fetchImpl } = account();
+      fetchImpl.mockImplementation(() => new Promise(() => {}));
+      const settled = vi.fn();
+      const poll = client.sync({ filter: '7', timeoutMs: 30_000 }).catch(settled);
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(settled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await poll;
+      expect(settled.mock.calls[0][0]).toMatchObject({ message: 'HTTP request timed out', transient: true });
+      const abort = new AbortController();
+      const called = client.sync({ filter: '7', timeoutMs: 30_000, signal: abort.signal });
+      abort.abort();
+      await expect(called).rejects.toMatchObject({ message: 'HTTP request aborted', transient: true });
+      expect(fetchImpl.mock.calls[1][1]?.signal?.aborted).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('reads earlier events between two tokens', async () => {
+    const { client, fetchImpl } = account();
+    fetchImpl.mockResolvedValue(Response.json({ chunk: [{ type: 'm.room.message' }], end: 'e' }));
+    await expect(client.messages('!room:example', 'from', 'to', ['m.room.message'])).resolves.toEqual({ events: [{ type: 'm.room.message' }], end: 'e' });
+    const url = new URL(String(fetchImpl.mock.calls[0][0]));
+    expect(url.pathname).toBe('/_matrix/client/v3/rooms/!room%3Aexample/messages');
+    expect(Object.fromEntries(url.searchParams)).toEqual({ dir: 'b', from: 'from', to: 'to', limit: '100', filter: '{"types":["m.room.message"]}' });
   });
 });

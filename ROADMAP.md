@@ -1,8 +1,8 @@
 # Matrix bridge roadmap
 
-The current milestone is an experimental, explicitly allowlisted **plaintext** application
-service. See [supported behavior and limits](./README.md) and the
-[Discord ecosystem parity table](./README.md#bridge-ecosystem-parity).
+The bridge is experimental and relays **plaintext** only: as an application service or as an ordinary
+account, managed from Harmony, run by a Harmony instance or by `config.json`. See [behaviour and limits](./README.md) and the
+[comparison with the Discord bridge](./README.md#compared-with-the-discord-bridge).
 These are follow-ups, not supported features.
 
 ## Encrypted participation and media
@@ -24,15 +24,13 @@ plaintext or keys the bridge previously received.
 
 1. Harmony → Matrix reply context.
 2. Permission-aware edits, deletes/redactions and reactions, with durable mappings and consent.
-3. Clearer setup, diagnostics and configuration lifecycle; guided installation where possible.
-4. Threads, richer formatting, emoji/stickers and channel references as separately tested features.
+3. Threads, richer formatting, emoji/stickers and channel references as separately tested features.
 
-Presence, role/structure synchronization, account linking and shared hosting need explicit
-product/security decisions; Matrix power levels must not grant native Harmony rights.
+Presence, role/structure synchronization and account linking need explicit product/security
+decisions; Matrix power levels must not grant native Harmony rights.
 
 ## Harmony integration
 
-Native UI, profiles/mentions, registration, database migrations and scoped API contracts
-remain in [Harmony](https://github.com/y4my4my4m/harmony). Initial support shipped in
-Harmony 1.9.8.
-Validate compatible deployed Gateway/DB contracts before a community-facing release.
+Native UI, profiles/mentions, registration, database migrations and scoped API contracts remain in
+[Harmony](https://github.com/y4my4my4m/harmony): application services with a bot of one's own since 1.9.8,
+managed and hosted bridges and opt-outs of Matrix people since 1.9.9.
